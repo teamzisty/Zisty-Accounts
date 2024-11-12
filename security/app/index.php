@@ -3,39 +3,27 @@
 ini_set('session.cookie_httponly', 1);
 ini_set('session.use_only_cookies', 1);
 ini_set('session.cookie_secure', 1);
-ini_set('session.cookie_samesite', 'Strict');
-ini_set('session.gc_maxlifetime', 3600);
-ini_set('session.use_strict_mode', 1);
-ini_set('session.sid_length', 48);
-ini_set('session.sid_bits_per_character', 6);
-
-// セキュリティ定数
-define('MAX_LOGIN_ATTEMPTS', 5);
-define('LOGIN_LOCKOUT_TIME', 1800);
-define('CSRF_TOKEN_EXPIRE', 3600);
-define('SESSION_LIFETIME', 3600);
-
-// ヘッダー
-header("X-Frame-Options: DENY");
-header("X-XSS-Protection: 1; mode=block");
-header("X-Content-Type-Options: nosniff");
-header("Referrer-Policy: strict-origin-only");
-header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
-header("Cache-Control: no-cache, no-store, must-revalidate");
-header("Pragma: no-cache");
-header("Expires: 0");
 
 // セッション開始
 if (session_status() === PHP_SESSION_NONE) {
   session_start();
 }
 
-// データベース接続
+// Google Authenticator クラスの読み込み
+require 'libs/GoogleAuthenticator.php';
+
+// データベースに接続
 $mysqli = new mysqli("", "", "", "");
-if ($mysqli->connect_error) {
-  die('データベースの接続に失敗しました: ' . $mysqli->connect_error);
+if ($mysqli->connect_errno) {
+  echo "データベースの接続に失敗しました: " . $mysqli->connect_error;
   exit();
 }
+
+// URLのクエリパラメータから'error'の値を取得
+$error = isset($_GET['error']) ? htmlspecialchars($_GET['error']) : '';
+
+// ユーザー情報を取得
+$user_id = $_SESSION["user_id"];
 
 // セッションのセキュリティチェック
 function validateSession()
@@ -115,31 +103,64 @@ if ($last_login_at) {
   exit();
 }
 
-// ユーザー名を取得
-$user_id = $_SESSION["user_id"];
-$query = "SELECT username, two_factor_enabled FROM users WHERE id = ?";
+// ユーザー情報を取得
+$query = "SELECT username, email FROM users WHERE id = ?";
 $stmt = $mysqli->prepare($query);
 $stmt->bind_param("i", $user_id);
 $stmt->execute();
-$stmt->bind_result($username, $two_factor_enabled);
+$stmt->bind_result($username, $email);
 $stmt->fetch();
 $stmt->close();
 
-// デバイス情報を取得
-$query = "SELECT ip_address, last_login_at, created_at FROM users_session WHERE username = ? ORDER BY created_at DESC";
-$stmt = $mysqli->prepare($query);
+if (empty($email)) {
+  header("Location: ../?error=Emailが設定されていません。");
+  exit();
+}
+
+// Google Authenticator の設定
+$g = new PHPGangsta_GoogleAuthenticator();
+
+// ユーザーの二段階認証の状態を確認
+$stmt = $mysqli->prepare("SELECT two_factor_enabled, two_factor_secret FROM users_factor WHERE username = ?");
+if ($stmt === false) {
+  die('Prepare statement failed: ' . $mysqli->error);
+}
 $stmt->bind_param("s", $username);
 $stmt->execute();
-$stmt->bind_result($ip_address, $last_login_at, $created_at);
-$devices = [];
-while ($stmt->fetch()) {
-  $devices[] = [
-    'ip_address' => $ip_address,
-    'last_login_at' => $last_login_at,
-    'created_at' => $created_at
-  ];
-}
+$result = $stmt->get_result();
+$factor_data = $result->fetch_assoc();
 $stmt->close();
+
+if ($factor_data && $factor_data['two_factor_enabled'] == 1) {
+  $secret = $factor_data['two_factor_secret'];
+} else {
+  $secret = $g->createSecret();
+
+  // 既存のエントリを削除
+  $stmt_delete = $mysqli->prepare("DELETE FROM users_factor WHERE username = ?");
+  if ($stmt_delete) {
+    $stmt_delete->bind_param("s", $username);
+    $stmt_delete->execute();
+    $stmt_delete->close();
+  }
+
+  // 新しいエントリを挿入
+  $stmt_insert = $mysqli->prepare("INSERT INTO users_factor (username, two_factor_secret) VALUES (?, ?)");
+  if ($stmt_insert) {
+    $stmt_insert->bind_param("ss", $username, $secret);
+    $stmt_insert->execute();
+    $stmt_insert->close();
+  }
+}
+
+$issuer = 'Zisty';
+$accountName = $username;
+$qrCodeUrl = $g->getQRCodeGoogleUrl($accountName, $secret, $issuer);
+
+
+// CSRFトークンの生成
+$_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+$_SESSION['csrf_token_time'] = time();
 
 $mysqli->close();
 ?>
@@ -166,13 +187,13 @@ $mysqli->close();
 
 <head>
   <meta charset="UTF-8">
-  <title>Security｜Zisty</title>
+  <title>App｜Security｜Zisty</title>
   <meta name="keywords" content=" Zisty,ジスティー">
   <meta name="description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="copyright" content="Copyright &copy; 2024 Zisty. All rights reserved." />
   <!-- OGP Meta Tags -->
-  <meta property="og:title" content="Security" />
+  <meta property="og:title" content="App" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://accounts.zisty.net/" />
   <meta property="og:image" content="https://accounts.zisty.net/images/header.jpg" />
@@ -184,7 +205,7 @@ $mysqli->close();
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:site" content="@teamzisty">
   <meta name="twitter:creator" content="@teamzisty" />
-  <meta name="twitter:title" content="Security / Zisty Accounts">
+  <meta name="twitter:title" content="App / Zisty Accounts">
   <meta name="twitter:description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="twitter:image" content="https://accounts.zisty.net/images/header.jpg">
@@ -209,13 +230,90 @@ $mysqli->close();
       cursor: pointer;
       margin-top: 0;
       min-width: 80px;
+      width: 100%;
     }
 
     .settings-btn:hover {
       border: 1px solid #636363;
       background-color: #1b1b1b;
     }
+
+    .qr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px;
+      border: 1px solid #585858;
+      border-radius: 5px;
+      width: 200px;
+      background-color: #ffffff;
+    }
+
+    .digit-input {
+      width: 30px;
+      height: 40px;
+      text-align: center;
+      font-size: 2em;
+      border: 2px solid #808080;
+      border-radius: 10px;
+      transition: border-color 0.3s ease, background-color 0.3s ease;
+      outline: none;
+      margin-right: 5px;
+    }
+
+    .digit-input:hover {
+      border: 2px solid #007BFF;
+    }
+
+    .digit-input:focus {
+      border: 2px solid #007BFF;
+    }
+
+    .digit-input::-webkit-outer-spin-button,
+    .digit-input::-webkit-inner-spin-button {
+      -webkit-appearance: none;
+    }
+
+    .digit-input[type="number"] {
+      -moz-appearance: textfield;
+    }
+
+    .digit-input:-webkit-autofill,
+    .digit-input:-webkit-autofill:hover,
+    .digit-input:-webkit-autofill:focus {
+      -webkit-text-fill-color: #979797 !important;
+      -webkit-box-shadow: 0 0 0 30px #181a1b inset !important;
+      transition: background-color 5000s ease-in-out 0s;
+    }
   </style>
+  <script>
+    window.onload = function() {
+      const urlParams = new URLSearchParams(window.location.search);
+
+      if (urlParams.get('success') === '1') {
+        showDialog("正常に保存されました！");
+        const iconElement = document.getElementById('user-icon');
+        if (iconElement) {
+          const iconUrl = iconElement.src;
+          iconElement.src = '';
+          iconElement.src = iconUrl + '?v=' + new Date().getTime();
+        }
+        const url = new URL(window.location);
+        url.searchParams.delete('success');
+        history.replaceState(null, '', url);
+
+      } else if (urlParams.get('error')) {
+        showDialog("" + decodeURIComponent(urlParams.get('error')));
+        const url = new URL(window.location);
+        url.searchParams.delete('error');
+        history.replaceState(null, '', url);
+      }
+    };
+
+    function showDialog(message) {
+      alert(message);
+    }
+  </script>
 </head>
 
 <body>
@@ -332,50 +430,68 @@ $mysqli->close();
 
     <div class="content">
       <section>
-        <h2>パスワード</h2>
-        <p>パスワードを変更することができます。パスワードを変更すると全デバイスからログアウトされてしまいますのでご注意ください。</p>
+        <h2>2段階認証アプリ</h2>
+        <p>2段階認証(2FA)として認証アプリを使用します。スマートフォンまたはタブレット用の認証アプリや拡張機能などを使用することによって取得できるコードを使って認証することができます。</p>
 
-        <button onclick="window.location.href='password/'"">パスワードを変更する</button>
+        <?php if ($factor_data && $factor_data['two_factor_enabled'] == 1): ?>
+          <h3>要素の無効化</h3>
+          <p>二段階認証を無効化にするにはパスワードを入力する必要があります。</p>
+          <form action="disable_2fa.php" method="post">
+            <label for="current_password">パスワード<br></label>
+            <input type="password" name="password" required>
+            <script>
+              const inputs = document.querySelectorAll('.digit-input');
+              inputs.forEach((input, index) => {
+                input.addEventListener('input', (e) => {
+                  const value = e.target.value;
+                  if (value.length === 1) {
+                    if (index < inputs.length - 1) {
+                      inputs[index + 1].focus();
+                    }
+                  }
+                  if (value.length > 1) {
+                    e.target.value = value.slice(0, 1);
+                  }
+                });
+                input.addEventListener('keydown', (e) => {
+                  if (e.key === 'Backspace' && input.value === '' && index > 0) {
+                    inputs[index - 1].focus();
+                  }
+                });
+              });
+            </script>
+
+            <button class="settings-btn">アプリの無効化</button>
+          </form>
+
+        <?php else: ?>
+          <h3>QRコードをスキャンする</h3>
+          <p>スマートフォンまたはタブレットで以下のQRコードをスキャンします。</p>
+          <div class="qr"><img
+              src=" <?php echo htmlspecialchars($qrCodeUrl); ?>"
+              alt="QR Code"></div>
+          <p style="font-size: 15px;">手動キー：<?php echo htmlspecialchars($secret); ?></p>
+
+
+          <h3>コードの確認</h3>
+          <p>2段階認証(2FA)追加に成功したらセキュリティコードを入力し、2段階認証を有効にしてください。</p>
+          <form action="verify_2fa.php" method="post">
+            <div class="input-container">
+              <input type="number" name="code1" class="digit-input" maxlength="1" required>
+              <input type="number" name="code2" class="digit-input" maxlength="1" required>
+              <input type="number" name="code3" class="digit-input" maxlength="1" required>
+              <input type="number" name="code4" class="digit-input" maxlength="1" required>
+              <input type="number" name="code5" class="digit-input" maxlength="1" required>
+              <input type="number" name="code6" class="digit-input" maxlength="1" required>
+            </div>
+            <script src="/js/querySelectorAll.js"></script>
+
+            <br>
+
+            <button class="settings-btn">アプリの有効化</button>
+          </form>
+        <?php endif; ?>
       </section>
-
-      <section>
-        <h2>二段階認証</h2>
-        <p>二段階認証を設定することでログイン時にパスワードのほかに新たな要素も要求されるため、アカウントのセキュリティを強化することができます。</p>
-        
-        <h3>二要素方式</h3>
-        <div class=" link">
-          <i class="bi bi-phone"></i>
-          <div class="content">
-            <h2 class="title">2段階認証アプリ</h2>
-            <p>2段階認証(2FA)として認証アプリを使用します。 サインインの際に、認証アプリにより提供されるセキュリティコードが必要になります。</p>
-          </div>
-          <?php if ($two_factor_enabled == 0): ?>
-            <button onclick="window.location.href='app/'" class="settings-btn">設定</button>
-          <?php else: ?>
-            <button onclick="window.location.href='app/'" class="release-btn">解除</button>
-          <?php endif; ?>
-    </div>
-
-    <h3>回復オプション</h3>
-    <div class=" link">
-      <i class="bi bi-key"></i>
-      <div class="content">
-        <h2 class="title">Recovery codes</h2>
-        <p>デバイスへログインできなくなり、二段階認証コードを確認できない場合にRecovery codeを使用してアカウントにアクセスすることができます。</p>
-      </div>
-      <?php if ($two_factor_enabled == 0): ?>
-        <button onclick="window.location.href='recovery-codes/'" class="settings-btn">見る</button>
-      <?php else: ?>
-        <button onclick="" class="invalid-btn">見る</button>
-      <?php endif; ?>
-    </div>
-    </section>
-
-    <section style="background-color: #ff2f0005;">
-      <h2 style="color: #fc8a84;">全てのデバイスからログアウト</h2>
-      <p>ログインしている全てのデバイスからログアウトすることができます。ログアウトしたデバイスでは、もう一度ログインし直す必要があります。</p>
-      <button onclick="window.location.href='/API/all.logout.php'" class="button-warning">全てのデバイスからログアウト</button>
-    </section>
     </div>
   </main>
 

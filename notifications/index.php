@@ -115,31 +115,75 @@ if ($last_login_at) {
   exit();
 }
 
-// ユーザー名を取得
-$user_id = $_SESSION["user_id"];
-$query = "SELECT username, two_factor_enabled FROM users WHERE id = ?";
-$stmt = $mysqli->prepare($query);
+// Ajax リクエストの処理
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  $response = ['success' => false, 'message' => ''];
+
+  if (isset($_POST['action'])) {
+    switch ($_POST['action']) {
+      case 'update_notifications':
+        $notifications_array = [
+          'security' => isset($_POST['security']) && $_POST['security'] === 'true',
+          'announcements' => isset($_POST['announcements']) && $_POST['announcements'] === 'true',
+          'status' => isset($_POST['status']) && $_POST['status'] === 'true'
+        ];
+        break;
+
+      case 'unsubscribe_all':
+        $notifications_array = [
+          'security' => false,
+          'announcements' => false,
+          'status' => false
+        ];
+        break;
+
+      default:
+        $response['message'] = '不正なアクションです';
+        header('Content-Type: application/json');
+        echo json_encode($response);
+        exit();
+    }
+
+    $notifications_json = json_encode($notifications_array);
+
+    $stmt = $mysqli->prepare("UPDATE users SET notifications = ? WHERE id = ?");
+    if ($stmt === false) {
+      $response['message'] = 'Prepare statement failed: ' . $mysqli->error;
+    } else {
+      $stmt->bind_param("si", $notifications_json, $user_id);
+      if ($stmt->execute()) {
+        $response['success'] = true;
+        $response['message'] = '設定を保存しました';
+        $response['notifications'] = $notifications_array;
+      } else {
+        $response['message'] = '保存に失敗しました: ' . $stmt->error;
+      }
+      $stmt->close();
+    }
+  }
+
+  header('Content-Type: application/json');
+  echo json_encode($response);
+  exit();
+}
+
+// 通知設定の取得
+$stmt = $mysqli->prepare("SELECT notifications FROM users WHERE id = ?");
 $stmt->bind_param("i", $user_id);
 $stmt->execute();
-$stmt->bind_result($username, $two_factor_enabled);
+$stmt->bind_result($notifications);
 $stmt->fetch();
 $stmt->close();
 
-// デバイス情報を取得
-$query = "SELECT ip_address, last_login_at, created_at FROM users_session WHERE username = ? ORDER BY created_at DESC";
-$stmt = $mysqli->prepare($query);
-$stmt->bind_param("s", $username);
-$stmt->execute();
-$stmt->bind_result($ip_address, $last_login_at, $created_at);
-$devices = [];
-while ($stmt->fetch()) {
-  $devices[] = [
-    'ip_address' => $ip_address,
-    'last_login_at' => $last_login_at,
-    'created_at' => $created_at
+// 現在の設定を取得
+$notifications = json_decode($notifications, true);
+if ($notifications === null) {
+  $notifications = [
+    'security' => true,
+    'announcements' => false,
+    'status' => false
   ];
 }
-$stmt->close();
 
 $mysqli->close();
 ?>
@@ -166,13 +210,13 @@ $mysqli->close();
 
 <head>
   <meta charset="UTF-8">
-  <title>Security｜Zisty</title>
+  <title>Notifications｜Zisty</title>
   <meta name="keywords" content=" Zisty,ジスティー">
   <meta name="description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="copyright" content="Copyright &copy; 2024 Zisty. All rights reserved." />
   <!-- OGP Meta Tags -->
-  <meta property="og:title" content="Security" />
+  <meta property="og:title" content="Notifications" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://accounts.zisty.net/" />
   <meta property="og:image" content="https://accounts.zisty.net/images/header.jpg" />
@@ -184,7 +228,7 @@ $mysqli->close();
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:site" content="@teamzisty">
   <meta name="twitter:creator" content="@teamzisty" />
-  <meta name="twitter:title" content="Security / Zisty Accounts">
+  <meta name="twitter:title" content="Notifications / Zisty Accounts">
   <meta name="twitter:description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="twitter:image" content="https://accounts.zisty.net/images/header.jpg">
@@ -197,23 +241,85 @@ $mysqli->close();
     document.write('<link rel="stylesheet" href="https://accounts.zisty.net/css/style.css?time=' + timeStamp + '">');
   </script>
   <style>
-    .settings-btn {
-      font-size: 14px;
-      padding: 10px 25px;
-      margin-right: 10px;
-      border: none;
-      background-color: #1b1b1b;
-      color: #cfcfcf;
-      border: 1px solid #414141;
-      border-radius: 3px;
-      cursor: pointer;
-      margin-top: 0;
-      min-width: 80px;
+    .content .title {
+      font-size: 20px;
     }
 
-    .settings-btn:hover {
-      border: 1px solid #636363;
-      background-color: #1b1b1b;
+    .content .description {
+      color: #cfcfcf;
+    }
+
+    .link {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0px 5px;
+      border: 1px solid #2b2b2b;
+      border-radius: 5px;
+      margin-top: 15px;
+    }
+
+    .link i {
+      padding: 10px;
+      border-radius: 5px;
+      margin-left: 10px;
+      font-size: 25px;
+    }
+
+    .link p {
+      font-size: 12px;
+      margin-bottom: 0;
+      margin-top: 10px;
+    }
+
+    .link .title {
+      margin: 0;
+      font-size: 15px;
+    }
+
+    .switch {
+      font-size: 17px;
+      position: relative;
+      display: inline-block;
+      min-width: 3.1em;
+      height: 30px;
+      margin-right: 15px;
+      margin-bottom: 10px;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      border: 1px solid #414141;
+      border-radius: 50px;
+      transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 1.2em;
+      width: 1.2em;
+      left: 0.2em;
+      bottom: 0.2em;
+      background-color: rgb(182, 182, 182);
+      border-radius: inherit;
+      transition: all 1s cubic-bezier(0.23, 1, 0.320, 1);
+    }
+
+    .switch input:checked+.slider {
+      border: 1px solid #414141;
+    }
+
+    .switch input:checked+.slider:before {
+      transform: translateX(1.4em);
     }
   </style>
 </head>
@@ -269,8 +375,8 @@ $mysqli->close();
           </li>
         </a>
         <a href="/notifications/" class="nav-link">
-          <li class="nav-item" role="menuitem">
-            <i class="bi bi-bell"></i>
+          <li class="nav-item koko" role="menuitem">
+            <i class="bi bi-bell-fill"></i>
             <span>Notifications</span>
           </li>
         </a>
@@ -285,8 +391,8 @@ $mysqli->close();
           </li>
         </a>
         <a href="/security/" class="nav-link">
-          <li class="nav-item koko" role="menuitem">
-            <i class="bi bi-shield-lock-fill"></i>
+          <li class="nav-item" role="menuitem">
+            <i class="bi bi-shield-lock"></i>
             <span>Security</span>
           </li>
         </a>
@@ -332,55 +438,121 @@ $mysqli->close();
 
     <div class="content">
       <section>
-        <h2>パスワード</h2>
-        <p>パスワードを変更することができます。パスワードを変更すると全デバイスからログアウトされてしまいますのでご注意ください。</p>
+        <h2>通知</h2>
+        <p>通知は設定されているメールアドレスを使用して送信されます。</p>
 
-        <button onclick="window.location.href='password/'"">パスワードを変更する</button>
+        <div class="link">
+          <div class="content">
+            <h2 class="title">セキュリティメール</h2>
+            <p>アカウントにログインされた場合やパスワードが変更された場合にメールでお知らせします。</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" name="security" <?php echo $notifications['security'] ? 'checked' : ''; ?> onchange="updateNotification(this)">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="link">
+          <div class="content">
+            <h2 class="title">アナウンス＆アップデート</h2>
+            <p>Zisty Accountsの最新の機能や改善、バグの修正などをメールでお知らせします。</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" name="announcements" <?php echo $notifications['announcements'] ? 'checked' : ''; ?> onchange="updateNotification(this)">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="link">
+          <div class="content">
+            <h2 class="title">ステータスメール</h2>
+            <p>Zisty Accountsがログインできなくなる問題が発生したり、サービスの連携が行えなくなる問題などが発生した場合にメールでお知らせします。</p>
+          </div>
+          <label class="switch">
+            <input type="checkbox" name="status" <?php echo $notifications['status'] ? 'checked' : ''; ?> onchange="updateNotification(this)">
+            <span class="slider"></span>
+          </label>
+        </div>
       </section>
 
-      <section>
-        <h2>二段階認証</h2>
-        <p>二段階認証を設定することでログイン時にパスワードのほかに新たな要素も要求されるため、アカウントのセキュリティを強化することができます。</p>
-        
-        <h3>二要素方式</h3>
-        <div class=" link">
-          <i class="bi bi-phone"></i>
-          <div class="content">
-            <h2 class="title">2段階認証アプリ</h2>
-            <p>2段階認証(2FA)として認証アプリを使用します。 サインインの際に、認証アプリにより提供されるセキュリティコードが必要になります。</p>
-          </div>
-          <?php if ($two_factor_enabled == 0): ?>
-            <button onclick="window.location.href='app/'" class="settings-btn">設定</button>
-          <?php else: ?>
-            <button onclick="window.location.href='app/'" class="release-btn">解除</button>
-          <?php endif; ?>
-    </div>
-
-    <h3>回復オプション</h3>
-    <div class=" link">
-      <i class="bi bi-key"></i>
-      <div class="content">
-        <h2 class="title">Recovery codes</h2>
-        <p>デバイスへログインできなくなり、二段階認証コードを確認できない場合にRecovery codeを使用してアカウントにアクセスすることができます。</p>
-      </div>
-      <?php if ($two_factor_enabled == 0): ?>
-        <button onclick="window.location.href='recovery-codes/'" class="settings-btn">見る</button>
-      <?php else: ?>
-        <button onclick="" class="invalid-btn">見る</button>
-      <?php endif; ?>
-    </div>
-    </section>
-
-    <section style="background-color: #ff2f0005;">
-      <h2 style="color: #fc8a84;">全てのデバイスからログアウト</h2>
-      <p>ログインしている全てのデバイスからログアウトすることができます。ログアウトしたデバイスでは、もう一度ログインし直す必要があります。</p>
-      <button onclick="window.location.href='/API/all.logout.php'" class="button-warning">全てのデバイスからログアウト</button>
-    </section>
-    </div>
+      <section style="background-color: #ff2f0005;">
+        <h2 style="color: #fc8a84;">全てのメールの配信登録を解除する</h2>
+        <p>これにはセキュリティに関するメール、アナウンスやアップデートに関するメール、ステータスに関するメールなどを含みます。</p>
+        <button onclick="unsubscribeAll()" class="button-warning">解除する</button>
+      </section>
   </main>
+
 
   <script src="/js/Warning.js"></script>
   <script src="/js/notification.js"></script>
+  <script>
+    let saveTimeout;
+    const notification = document.getElementById('notification');
+
+    function showNotification(message, success = true) {
+      notification.textContent = message;
+      notification.style.backgroundColor = success ? '#4CAF50' : '#f44336';
+      notification.classList.add('show');
+
+      setTimeout(() => {
+        notification.classList.remove('show');
+      }, 3000);
+    }
+
+    function updateNotification(checkbox) {
+      if (saveTimeout) {
+        clearTimeout(saveTimeout);
+      }
+      saveTimeout = setTimeout(() => {
+        const formData = new FormData();
+        formData.append('action', 'update_notifications');
+        document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+          formData.append(cb.name, cb.checked);
+        });
+
+        fetch(window.location.href, {
+            method: 'POST',
+            body: formData
+          })
+          .then(response => response.json())
+          .then(data => {
+            if (data.success) {
+
+            } else {
+  
+            }
+          })
+          .catch(error => {
+            showDialog('エラーが発生しました');
+          });
+      }, 10);
+    }
+
+    function unsubscribeAll() {
+      const formData = new FormData();
+      formData.append('action', 'unsubscribe_all');
+
+      fetch(window.location.href, {
+          method: 'POST',
+          body: formData
+        })
+        .then(response => response.json())
+        .then(data => {
+          if (data.success) {
+            document.querySelectorAll('input[type="checkbox"]').forEach(checkbox => {
+              checkbox.checked = false;
+            });
+            showDialog("全ての通知を解除しました");
+          } else {
+            showDialog("全ての通知を解除しました");
+          }
+        })
+        .catch(error => {
+          showDialog('Error:', error);
+          showNotification('エラーが発生しました', false);
+        });
+    }
+  </script>
 </body>
 
 </html>

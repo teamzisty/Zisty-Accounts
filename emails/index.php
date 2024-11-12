@@ -33,12 +33,15 @@ if (session_status() === PHP_SESSION_NONE) {
 // データベースに接続
 $mysqli = new mysqli("", "", "", "");
 if ($mysqli->connect_errno) {
-  echo "データベースの接続に失敗しました: " . $mysqli->connect_error;
-  exit();
+  die("データベースの接続に失敗しました: " . $mysqli->connect_error);
 }
 
 // ユーザー情報を取得
-$user_id = $_SESSION["user_id"];
+$user_id = $_SESSION["user_id"] ?? null;
+if (!$user_id) {
+  header("Location: /login/");
+  exit();
+}
 
 // セッションのセキュリティチェック
 function validateSession()
@@ -118,53 +121,15 @@ if ($last_login_at) {
   exit();
 }
 
-// データベースからユーザー情報を取得
-$query = "SELECT username, email, name, created_at, private_id, icon_path FROM users WHERE id = ?";
-$stmt = $mysqli->prepare($query);
+// ユーザー情報を取得
+$stmt = $mysqli->prepare("SELECT username, email FROM users WHERE id = ?");
 $stmt->bind_param("i", $user_id);
 $stmt->execute();
-$stmt->bind_result($username, $email, $encrypted_name, $created_at, $private_id, $icon_path);
+$stmt->bind_result($username, $email);
 $stmt->fetch();
 $stmt->close();
 
-// 名前を複合化
-$name = decryptUsername($encrypted_name, $private_id);
-
-// 暗号化関数
-function encryptUsername($username, $private_id)
-{
-  $cipher = "aes-256-cbc";
-  $key = substr(hash('sha256', $private_id, true), 0, 32);
-  $iv_length = openssl_cipher_iv_length($cipher);
-  $iv = openssl_random_pseudo_bytes($iv_length);
-  $encrypted = openssl_encrypt($username, $cipher, $key, 0, $iv);
-  return base64_encode($encrypted . '::' . $iv);
-}
-
-// 複合化処理
-function decryptUsername($encrypted_name, $private_id)
-{
-  $cipher = "aes-256-cbc";
-  $key = substr(hash('sha256', $private_id, true), 0, 32);
-  list($encrypted_data, $iv) = explode('::', base64_decode($encrypted_name), 2);
-  $decrypted = openssl_decrypt($encrypted_data, $cipher, $key, 0, $iv);
-  return $decrypted;
-}
-
-
-// 連携チェックをする関数
-$sso_query = "SELECT SSO FROM users WHERE id = ?";
-$stmt = $mysqli->prepare($sso_query);
-$stmt->bind_param("i", $user_id);
-$stmt->execute();
-$stmt->bind_result($SSO);
-$stmt->fetch();
-$stmt->close();
-$form_disabled = ($SSO === 'Google' || $SSO === 'GitHub');
-
-// アイコンが設定されていない場合の代わりのアイコンのURLを設定
-$default_icon = '/@/default.webp';
-$icon_path = !empty($icon_path) && file_exists($_SERVER['DOCUMENT_ROOT'] . $icon_path) ? $icon_path : $default_icon;
+$email_sent = false;
 
 // フォームが送信された場合の処理
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
@@ -176,87 +141,74 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     !isset($_SESSION['csrf_token_time']) ||
     time() - $_SESSION['csrf_token_time'] > CSRF_TOKEN_EXPIRE
   ) {
-    header("Location: /login?error=" . urlencode('無効なリクエストです。'));
+    header("Location: /emails?error=" . urlencode('無効なリクエストです。'));
     exit();
   }
-  $new_name = $_POST['name'];
 
-  // ユーザー名の検証
-  if (empty($new_name)) {
-    $error_message = "ユーザー名が入力されていません。";
-  } elseif (strlen($new_name) > 50 || strlen($new_name) < 3) {
-    $error_message = "ユーザー名は3文字以上50文字未満で入力してください。";
-  } else {
-    if (isset($_FILES['icon']) && $_FILES['icon']['error'] === UPLOAD_ERR_OK) {
-      $file_tmp = $_FILES['icon']['tmp_name'];
-      $file_name = $username . '.webp';
-      $destination = $_SERVER['DOCUMENT_ROOT'] . '/@/icons/' . $file_name;
+  $new_email = $_POST["new_email"];
+  $current_password = $_POST["current_password"];
 
-      if ($_FILES['icon']['size'] > 5 * 1024 * 1024) {
-        $error_message = "ファイルサイズは5MBを超えてはいけません";
-      } else {
-        if (file_exists($destination)) {
-          unlink($destination);
-        }
-        $image = imagecreatefromstring(file_get_contents($file_tmp));
-        if ($image !== false) {
-          if (imagewebp($image, $destination)) {
-            imagedestroy($image);
+  // 新しいメールアドレスが既に存在するか確認
+  $stmt = $mysqli->prepare("SELECT COUNT(*) FROM users WHERE email = ?");
+  $stmt->bind_param("s", $new_email);
+  $stmt->execute();
+  $stmt->bind_result($count);
+  $stmt->fetch();
+  $stmt->close();
 
-            $icon_path = '/@/icons/' . $file_name;
+  if ($count > 0) {
+    $error_message = "このメールアドレスは既に使用されています。";
+  }
 
-            $update_icon_query = "UPDATE users SET icon_path = ? WHERE id = ?";
-            $update_icon_stmt = $mysqli->prepare($update_icon_query);
-            $update_icon_stmt->bind_param("si", $icon_path, $user_id);
-            if ($update_icon_stmt->execute()) {
-              $message = "アイコンが更新されました";
-              $success = true;
-            } else {
-              $error_message = "データベース更新に失敗しました: " . $update_icon_stmt->error;
-            }
-            $update_icon_stmt->close();
-          } else {
-            $error_message = "画像の保存に失敗しました";
-          }
-        } else {
-          $error_message = "画像のアップロードに失敗しました";
-        }
-      }
-    }
+  $stmt = $mysqli->prepare("SELECT password FROM users WHERE id = ?");
+  $stmt->bind_param("i", $user_id);
+  $stmt->execute();
+  $stmt->bind_result($hashed_password);
+  $stmt->fetch();
+  $stmt->close();
 
-    // 名前を暗号化して保存
-    $encrypted_name = encryptUsername($new_name, $private_id);
-    $update_query = "UPDATE users SET name = ? WHERE id = ?";
-    $update_stmt = $mysqli->prepare($update_query);
-    $update_stmt->bind_param("si", $encrypted_name, $user_id);
-    $update_stmt->execute();
-    $update_stmt->close();
-
-    // 更新された情報を取得し直す
-    $query = "SELECT username, name, notifications, created_at, private_id FROM users WHERE id = ?";
-    $stmt = $mysqli->prepare($query);
-    $stmt->bind_param("i", $userId);
+  if (password_verify($current_password, $hashed_password)) {
+    $token = bin2hex(random_bytes(32));
+    $expires_at = (new DateTime())->add(new DateInterval('P1D'))->format('Y-m-d H:i:s');
+    $stmt = $mysqli->prepare("INSERT INTO users_verification (user_id, type, token, email, expires_at) VALUES (?, 'email_verification', ?, ?, ?)");
+    $stmt->bind_param("isss", $user_id, $token, $new_email, $expires_at);
     $stmt->execute();
-    $stmt->bind_result($username, $encrypted_name, $notifications, $created_at, $private_id);
-    $stmt->fetch();
     $stmt->close();
 
-    // 名前を複合化
-    $name = decryptUsername($encrypted_name, $private_id);
+    // 認証リンクの作成
+    $verify_link = "https://accounts.zisty.net/auth/email/?token={$token}";
 
-    if (!isset($error_message)) {
-      $message = "情報が更新されました。";
-      $success = true;
+    // メール送信
+    $to = $new_email;
+    $subject = "メールアドレスの認証";
+    $message = "
+          <html>
+          <head>
+            <title>メールアドレスの認証｜Zisty</title>
+          </head>
+          <body>
+            <p>{$username} 様</p>
+            <p>メールアドレスを確認するには、次のリンクをクリックしてください。</p>
+            <a href='{$verify_link}'>{$verify_link}</a>
+            <p>このアドレスの確認を依頼していない場合は、このメールを無視してください。</p>
+            <p>よろしくお願い致します。</p>
+            <p>TeamZisty / Zisty Accounts</p>
+          </body>
+          </html>
+      ";
+
+    $headers = "MIME-Version: 1.0\r\n";
+    $headers .= "Content-type:text/html;charset=UTF-8\r\n";
+    $headers .= "From: Zisty Accounts <no-reply@zisty.net>\r\n";
+
+    if (mail($to, $subject, $message, $headers)) {
+      $email_sent = true;
+    } else {
+      $error_message = "メールの送信に失敗しました。";
     }
-  }
-
-  // 結果に応じてリダイレクト
-  if (isset($success) && $success) {
-    header("Location: ?success=1");
   } else {
-    header("Location: ?error=" . urlencode($error_message));
+    $error_message = "パスワードが間違っています。";
   }
-  exit();
 }
 
 // CSRFトークンの生成
@@ -288,25 +240,27 @@ $mysqli->close();
 
 <head>
   <meta charset="UTF-8">
-  <title>Profile｜Zisty</title>
+  <title>Emails｜Zisty</title>
   <meta name="keywords" content=" Zisty,ジスティー">
   <meta name="description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="copyright" content="Copyright &copy; 2024 Zisty. All rights reserved." />
   <!-- OGP Meta Tags -->
-  <meta property="og:title" content="Profile" />
+  <meta property="og:title" content="Emails" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://accounts.zisty.net/" />
   <meta property="og:image" content="https://accounts.zisty.net/images/header.jpg" />
-  <meta property="og:description" content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?" />
+  <meta property="og:description"
+    content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?" />
   <meta property="og:site_name" content="Zisty Accounts" />
   <meta property="og:locale" content="ja_JP" />
   <!-- Twitter Card Meta Tags (if needed) -->
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:site" content="@teamzisty">
   <meta name="twitter:creator" content="@teamzisty" />
-  <meta name="twitter:title" content="Profile / Zisty Accounts">
-  <meta name="twitter:description" content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
+  <meta name="twitter:title" content="Emails / Zisty Accounts">
+  <meta name="twitter:description"
+    content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="twitter:image" content="https://accounts.zisty.net/images/header.jpg">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <link rel="shortcut icon" type="image/x-icon" href="/favicon.png">
@@ -318,104 +272,60 @@ $mysqli->close();
     document.write('<link rel="stylesheet" href="https://accounts.zisty.net/css/style.css?time=' + timeStamp + '">');
   </script>
   <style>
-    /* Profile */
-    .input-button-group {
-      display: flex;
-      align-items: center;
-      margin-bottom: 15px;
-    }
-
-    .input-button-group input {
-      flex-grow: 1;
-      margin-bottom: 0;
-    }
-
-    .input-button-group button {
-      margin-left: 10px;
+    .settings-btn {
+      font-size: 14px;
+      padding: 10px 25px;
+      margin-right: 10px;
+      border: none;
+      background-color: #1b1b1b;
+      color: #cfcfcf;
+      border: 1px solid #414141;
+      border-radius: 3px;
+      cursor: pointer;
       margin-top: 0;
-      height: 38px;
-      width: 50px;
-      margin-bottom: -5px;
-      border: 1px solid #dcdcdc67;
-      background-color: #111111;
-      color: #979797;
-      transition: 0.3s;
+      min-width: 80px;
     }
 
-    .input-button-group button:hover {
-      transform: scale(1.00);
-      background-color: #0e0f0f;
+    .settings-btn:hover {
+      border: 1px solid #636363;
+      background-color: #1b1b1b;
     }
 
-    .input-button-group button:disabled {
-      cursor: not-allowed;
-    }
-
-
-    .eyes {
-      font-size: 12px;
-      margin-bottom: -7px;
-      color: #dcdcdc67;
-    }
-
-    .eves i {
-      margin-right: 4px;
-    }
-
-    .icon-container {
+    .switch {
+      font-size: 17px;
       position: relative;
       display: inline-block;
+      min-width: 3.1em;
+      height: 30px;
+      margin-right: 15px;
       margin-bottom: 10px;
     }
 
-    .user_icon {
-      width: 80px;
-      height: 80px;
-      border-radius: 50%;
-      box-shadow: 0 0px 25px 0 rgba(58, 58, 58, 0.5);
-      transition: opacity 0.3s ease;
-      cursor: pointer;
-    }
-
-    .icon-container i {
-      position: absolute;
-      transform: translateX(-100%);
-      font-size: 24px;
-      color: #ffffff83;
+    .switch input {
       opacity: 0;
-      transition: opacity 0.3s ease;
-      pointer-events: none;
+      width: 0;
+      height: 0;
     }
 
-    .icon-container:hover .user_icon {
-      opacity: 0.6;
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      border: 1px solid #414141;
+      border-radius: 50px;
+      transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
     }
 
-    .icon-container:hover i {
-      opacity: 1;
-    }
-
-    .tag-container {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: left;
-      margin-top: 10px;
-      margin-bottom: 15px;
-    }
-
-    .tag {
-      background-color: #d4d4d400;
-      border: 1px solid #ffffff4d;
-      color: #797979;
-      padding: 5px 10px;
-      margin-right: 8px;
-      border-radius: 20px;
-      font-size: 12px;
-    }
-
-    .tag i {
-      font-size: 14px;
-      margin-right: 3px;
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 1.2em;
+      width: 1.2em;
+      left: 0.2em;
+      bottom: 0.2em;
+      background-color: rgb(182, 182, 182);
+      border-radius: inherit;
+      transition: all 1s cubic-bezier(0.23, 1, 0.320, 1);
     }
   </style>
   <script>
@@ -481,8 +391,8 @@ $mysqli->close();
       <h2 class="category-title">Personal</h2>
       <ul class="nav-list" role="menu">
         <a href="/" class="nav-link">
-          <li class="nav-item koko" role="menuitem">
-            <i class="bi bi-person-fill"></i>
+          <li class="nav-item" role="menuitem">
+            <i class="bi bi-person"></i>
             <span>Profile</span>
           </li>
         </a>
@@ -521,8 +431,8 @@ $mysqli->close();
           </li>
         </a>
         <a href="/emails/" class="nav-link">
-          <li class="nav-item" role="menuitem">
-            <i class="bi bi-envelope-paper"></i>
+          <li class="nav-item koko" role="menuitem">
+            <i class="bi bi-envelope-paper-fill"></i>
             <span>Emails</span>
           </li>
         </a>
@@ -561,44 +471,53 @@ $mysqli->close();
     </nav>
 
     <div class="content">
-      <h2>プロフィール</h2>
-      <form method="post" action="" id="profile-form" onsubmit="return validateAuthForm()" enctype="multipart/form-data">
-        <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
-        <input type="hidden" name="g-recaptcha-response" id="g-recaptcha-response">
+      <?php if ($email): ?>
+        <section>
+          <h3><?php echo htmlspecialchars($email); ?></h3>
+          <p>登録されているメールアドレスへZisty Accountsへの通知やアカウント削除の確認、パスワードリセットの確認などのメールが送信されます。</p>
+        </section>
+      <?php endif; ?>
 
-        <div class="icon-container"><img src="<?php echo htmlspecialchars($icon_path) . '?v=' . time(); ?>" class="user_icon" id="userIcon" onclick="document.getElementById('icon').click();"><input type="file" id="icon" name="icon" style="display: none;" accept="image/*" onchange="previewIcon(event)"><i class="fa-regular fa-pen-to-square"></i></div>
-        <script>
-          function previewIcon(event) {
-            const file = event.target.files[0];
-            if (file) {
-              if (file.size > 5 * 1024 * 1024) {
-                showDialog("画像のサイズが5MBをオーバーしてしまいました。");
-                event.target.value = '';
-                return;
-              }
-              const reader = new FileReader();
-              reader.onload = function(e) {
-                document.getElementById('userIcon').src = e.target.result;
-              };
-              reader.readAsDataURL(file);
-            }
-          }
-        </script>
 
-        <label for="username">ユーザー名</label>
-        <input type="text" id="username" name="username" style="pointer-events: none;" value="<?php echo htmlspecialchars($username); ?>" required>
+      <section>
+        <h2>アドレスの変更
+        </h2>
+        <p>メールアドレスを変更することができます。変更、または追加することによって二段階認証の設定や制限されているサービスとの連携が可能になります。</p>
 
-        <label for="name">名前</label>
-        <input type="text" id="name" name="name" value="<?php echo htmlspecialchars($name); ?>" required>
+        <?php if (!$email_sent): ?>
+          <form method="post" action="">
+            <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+            <label for="current_password">パスワード<br></label>
+            <input type="password" id="confirm_password" name="current_password" required>
 
-        <label for="date">作成日</label>
-        <input type="text" id="date" name="date" style="pointer-events: none;" value="<?php echo htmlspecialchars($created_at); ?>" required>
+            <label for="new_email">新しいメールアドレス<br></label>
+            <input type="email" id="new_email" name="new_email" required>
 
-        <p class="eyes"><i class="bi bi-eye"></i> これらの情報は他のユーザーから見られる可能性があります。</p>
-        <br>
+            <button type="submit"><i class="fa-regular fa-paper-plane"></i> アドレスに認証URLを送信</button>
+          </form>
+        <?php else: ?>
+          <section style="padding: 0px 20px; margin: 0;">
+            <p>追加予定のメールアドレスへ確認URLを送信しました。</p>
+          </section>
+        <?php endif; ?>
+      </section>
 
-        <button type="submit" id="submitBtn" class="btn btn-primary">送信</button>
-      </form>
+      <section>
+        <h2>アドレスの非公開（開発者版）</h2>
+        <p>
+          サービスとの連携時、設定されたアドレスは使用せずに<?php echo htmlspecialchars($username); ?>@users.noreply.zisty.netを使用することができます。しかし、これを使用すると非公開を公開に切り替えたとき、そのサービスへそのままログインすることができなくなる可能性があります。よく考えてご使用ください。
+        </p>
+        <p>※現在設定不可能になっています。今後にご期待ください。</p>
+        <div class="link">
+          <div class="content">
+            <h2 class="title">Private Link</h2>
+          </div>
+          <label class="switch">
+            <input type="checkbox" name="status">
+            <span class="slider"></span>
+          </label>
+        </div>
+      </section>
     </div>
   </main>
 

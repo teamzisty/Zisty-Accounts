@@ -115,31 +115,75 @@ if ($last_login_at) {
   exit();
 }
 
-// ユーザー名を取得
-$user_id = $_SESSION["user_id"];
-$query = "SELECT username, two_factor_enabled FROM users WHERE id = ?";
-$stmt = $mysqli->prepare($query);
+// 言語を取得する関数
+$stmt = $mysqli->prepare("SELECT language FROM users WHERE id = ?");
+if ($stmt === false) {
+  die('Prepare statement failed: ' . $mysqli->error);
+}
 $stmt->bind_param("i", $user_id);
 $stmt->execute();
-$stmt->bind_result($username, $two_factor_enabled);
+$stmt->bind_result($language);
 $stmt->fetch();
 $stmt->close();
+$display_language = ($language === 'Japanese') ? '日本語' : 'English';
 
-// デバイス情報を取得
-$query = "SELECT ip_address, last_login_at, created_at FROM users_session WHERE username = ? ORDER BY created_at DESC";
-$stmt = $mysqli->prepare($query);
-$stmt->bind_param("s", $username);
-$stmt->execute();
-$stmt->bind_result($ip_address, $last_login_at, $created_at);
-$devices = [];
-while ($stmt->fetch()) {
-  $devices[] = [
-    'ip_address' => $ip_address,
-    'last_login_at' => $last_login_at,
-    'created_at' => $created_at
-  ];
+// セッション設定
+function generateCsrfToken() {
+  if (isset($_SESSION['csrf_token']) && isset($_SESSION['csrf_token_expire']) && 
+      $_SESSION['csrf_token_expire'] >= time()) {
+      return $_SESSION['csrf_token'];
+  }
+  $token = bin2hex(random_bytes(32));
+  $_SESSION['csrf_token'] = $token;
+  $_SESSION['csrf_token_expire'] = time() + CSRF_TOKEN_EXPIRE;
+  return $token;
 }
-$stmt->close();
+function validateCsrfToken($token) {
+  if (!isset($_SESSION['csrf_token']) || !isset($_SESSION['csrf_token_expire'])) {
+      return false;
+  }
+  if ($_SESSION['csrf_token_expire'] < time()) {
+      unset($_SESSION['csrf_token']);
+      unset($_SESSION['csrf_token_expire']);
+      return false;
+  }
+  return hash_equals($_SESSION['csrf_token'], $token);
+}
+
+// AJAXリクエストによる言語の更新処理
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['language'])) {
+  $submitted_token = $_POST['csrf_token'] ?? '';
+  if (!validateCsrfToken($submitted_token)) {
+    $error_message = "認証に失敗しました";
+  }
+
+  if (isset($_SESSION["user_id"])) {
+    $user_id = $_SESSION["user_id"];
+    $new_language = $_POST['language'];
+    $stmt = $mysqli->prepare("UPDATE users SET language = ? WHERE id = ?");
+    if ($stmt === false) {
+      die('Prepare statement failed: ' . $mysqli->error);
+    }
+    $stmt->bind_param("si", $new_language, $user_id);
+    $stmt->execute();
+    $stmt->close();
+    header("Location: ?success=1");
+    exit();
+  } else {
+    $error_message = "言語の更新に失敗しました";
+    exit();
+  }
+
+  // 結果に応じてリダイレクト
+  if (isset($success) && $success) {
+    header("Location: ?success=1");
+  } else {
+    header("Location: ?error=" . urlencode($error_message));
+  }
+  exit();
+}
+
+$csrf_token = generateCsrfToken();
 
 $mysqli->close();
 ?>
@@ -166,13 +210,13 @@ $mysqli->close();
 
 <head>
   <meta charset="UTF-8">
-  <title>Security｜Zisty</title>
+  <title>Language｜Zisty</title>
   <meta name="keywords" content=" Zisty,ジスティー">
   <meta name="description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="copyright" content="Copyright &copy; 2024 Zisty. All rights reserved." />
   <!-- OGP Meta Tags -->
-  <meta property="og:title" content="Security" />
+  <meta property="og:title" content="Language" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://accounts.zisty.net/" />
   <meta property="og:image" content="https://accounts.zisty.net/images/header.jpg" />
@@ -184,7 +228,7 @@ $mysqli->close();
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:site" content="@teamzisty">
   <meta name="twitter:creator" content="@teamzisty" />
-  <meta name="twitter:title" content="Security / Zisty Accounts">
+  <meta name="twitter:title" content="Language / Zisty Accounts">
   <meta name="twitter:description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="twitter:image" content="https://accounts.zisty.net/images/header.jpg">
@@ -197,6 +241,55 @@ $mysqli->close();
     document.write('<link rel="stylesheet" href="https://accounts.zisty.net/css/style.css?time=' + timeStamp + '">');
   </script>
   <style>
+    .content .title {
+      font-size: 20px;
+    }
+
+    .content .description {
+      color: #cfcfcf;
+    }
+
+    .button-style {
+      display: inline-block;
+      padding: 8px 20px;
+      background-color: #1b1b1b;
+      color: #cfcfcf;
+      border: 1px solid #414141;
+      text-align: center;
+      text-decoration: none;
+      border-radius: 10px;
+      font-size: 12px;
+      transition: all 0.3s ease;
+    }
+
+    .button-style:hover {
+      background-color: #1b1b1b;
+      border: 1px solid #2e2e2e;
+    }
+
+
+    .link {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0px 5px;
+      border: 1px solid #2b2b2b;
+      border-radius: 5px;
+      margin-top: 15px;
+    }
+
+    .link i {
+      padding: 10px;
+      border-radius: 5px;
+      margin-left: 10px;
+      font-size: 25px;
+    }
+
+    .link .title {
+      margin: 0;
+      font-size: 18px;
+    }
+
     .settings-btn {
       font-size: 14px;
       padding: 10px 25px;
@@ -208,7 +301,6 @@ $mysqli->close();
       border-radius: 3px;
       cursor: pointer;
       margin-top: 0;
-      min-width: 80px;
     }
 
     .settings-btn:hover {
@@ -263,7 +355,7 @@ $mysqli->close();
           </li>
         </a>
         <a href="/language/" class="nav-link">
-          <li class="nav-item" role="menuitem">
+          <li class="nav-item koko" role="menuitem">
             <i class="bi bi-globe"></i>
             <span>Language</span>
           </li>
@@ -285,8 +377,8 @@ $mysqli->close();
           </li>
         </a>
         <a href="/security/" class="nav-link">
-          <li class="nav-item koko" role="menuitem">
-            <i class="bi bi-shield-lock-fill"></i>
+          <li class="nav-item" role="menuitem">
+            <i class="bi bi-shield-lock"></i>
             <span>Security</span>
           </li>
         </a>
@@ -332,55 +424,36 @@ $mysqli->close();
 
     <div class="content">
       <section>
-        <h2>パスワード</h2>
-        <p>パスワードを変更することができます。パスワードを変更すると全デバイスからログアウトされてしまいますのでご注意ください。</p>
-
-        <button onclick="window.location.href='password/'"">パスワードを変更する</button>
+        <h2>言語（ベータ版）</h2>
+        <p>言語を設定することによって、連携時に共有され、そのサービスの言語を簡単に設定することができます。</p>
+        <form method="POST">
+          <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrf_token); ?>">
+          <select id="options" name="language">
+            <option value="Japanese" <?php if ($language === 'Japanese') echo 'selected'; ?>>日本語</option>
+            <option value="English" <?php if ($language === 'English') echo 'selected'; ?>>English</option>
+          </select>
+        </form>
       </section>
-
-      <section>
-        <h2>二段階認証</h2>
-        <p>二段階認証を設定することでログイン時にパスワードのほかに新たな要素も要求されるため、アカウントのセキュリティを強化することができます。</p>
-        
-        <h3>二要素方式</h3>
-        <div class=" link">
-          <i class="bi bi-phone"></i>
-          <div class="content">
-            <h2 class="title">2段階認証アプリ</h2>
-            <p>2段階認証(2FA)として認証アプリを使用します。 サインインの際に、認証アプリにより提供されるセキュリティコードが必要になります。</p>
-          </div>
-          <?php if ($two_factor_enabled == 0): ?>
-            <button onclick="window.location.href='app/'" class="settings-btn">設定</button>
-          <?php else: ?>
-            <button onclick="window.location.href='app/'" class="release-btn">解除</button>
-          <?php endif; ?>
-    </div>
-
-    <h3>回復オプション</h3>
-    <div class=" link">
-      <i class="bi bi-key"></i>
-      <div class="content">
-        <h2 class="title">Recovery codes</h2>
-        <p>デバイスへログインできなくなり、二段階認証コードを確認できない場合にRecovery codeを使用してアカウントにアクセスすることができます。</p>
-      </div>
-      <?php if ($two_factor_enabled == 0): ?>
-        <button onclick="window.location.href='recovery-codes/'" class="settings-btn">見る</button>
-      <?php else: ?>
-        <button onclick="" class="invalid-btn">見る</button>
-      <?php endif; ?>
-    </div>
-    </section>
-
-    <section style="background-color: #ff2f0005;">
-      <h2 style="color: #fc8a84;">全てのデバイスからログアウト</h2>
-      <p>ログインしている全てのデバイスからログアウトすることができます。ログアウトしたデバイスでは、もう一度ログインし直す必要があります。</p>
-      <button onclick="window.location.href='/API/all.logout.php'" class="button-warning">全てのデバイスからログアウト</button>
-    </section>
     </div>
   </main>
 
   <script src="/js/Warning.js"></script>
   <script src="/js/notification.js"></script>
+  <script>
+    document.getElementById('options').addEventListener('change', function() {
+      const selectedLanguage = this.value;
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "", true);
+      xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+      const csrfToken = document.querySelector('input[name="csrf_token"]').value;
+      xhr.onreadystatechange = function() {
+        if (xhr.readyState === 4 && xhr.status === 200) {
+          showDialog("正常に保存されました！");
+        }
+      };
+      xhr.send("language=" + encodeURIComponent(selectedLanguage) + "&csrf_token=" + encodeURIComponent(csrfToken));
+    });
+  </script>
 </body>
 
 </html>

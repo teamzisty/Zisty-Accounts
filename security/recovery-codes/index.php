@@ -37,8 +37,11 @@ if ($mysqli->connect_errno) {
   exit();
 }
 
+// URLのクエリパラメータから値を取得
+$error = isset($_GET['error']) ? htmlspecialchars($_GET['error']) : '';
+
 // ユーザー情報を取得
-$user_id = $_SESSION["user_id"];
+$user_id = isset($_SESSION["user_id"]) ? $_SESSION["user_id"] : null;
 
 // セッションのセキュリティチェック
 function validateSession()
@@ -118,56 +121,77 @@ if ($last_login_at) {
   exit();
 }
 
-// データベースからユーザー情報を取得
-$query = "SELECT username, email, name, created_at, private_id, icon_path FROM users WHERE id = ?";
-$stmt = $mysqli->prepare($query);
+// ユーザー情報を取得
+$stmt = $mysqli->prepare("SELECT username, email FROM users WHERE id = ?");
 $stmt->bind_param("i", $user_id);
 $stmt->execute();
-$stmt->bind_result($username, $email, $encrypted_name, $created_at, $private_id, $icon_path);
-$stmt->fetch();
+$result = $stmt->get_result();
+$user_data = $result->fetch_assoc();
+$username = $user_data['username'];
+$email = $user_data['email'];
 $stmt->close();
 
-// 名前を複合化
-$name = decryptUsername($encrypted_name, $private_id);
-
-// 暗号化関数
-function encryptUsername($username, $private_id)
-{
-  $cipher = "aes-256-cbc";
-  $key = substr(hash('sha256', $private_id, true), 0, 32);
-  $iv_length = openssl_cipher_iv_length($cipher);
-  $iv = openssl_random_pseudo_bytes($iv_length);
-  $encrypted = openssl_encrypt($username, $cipher, $key, 0, $iv);
-  return base64_encode($encrypted . '::' . $iv);
+if (empty($email)) {
+  header("Location: ../");
+  exit();
 }
 
-// 複合化処理
-function decryptUsername($encrypted_name, $private_id)
+// Recovery codeを生成する関数
+function generateRecoveryCodes($count = 10)
 {
-  $cipher = "aes-256-cbc";
-  $key = substr(hash('sha256', $private_id, true), 0, 32);
-  list($encrypted_data, $iv) = explode('::', base64_decode($encrypted_name), 2);
-  $decrypted = openssl_decrypt($encrypted_data, $cipher, $key, 0, $iv);
-  return $decrypted;
+  $recovery_codes = [];
+  for ($i = 0; $i < $count; $i++) {
+    $recovery_code = strtoupper(bin2hex(random_bytes(5)));
+    $recovery_code = substr($recovery_code, 0, 5) . '-' . substr($recovery_code, 5, 5);
+    $recovery_codes[] = $recovery_code;
+  }
+  return $recovery_codes;
 }
 
+// アクセストークン確認
+if (isset($_COOKIE['recovery_codes_verification'])) {
+  $token = $_COOKIE['recovery_codes_verification'];
+  $stmt = $mysqli->prepare("SELECT user_id, is_verified FROM users_verification WHERE token = ? AND type = 'recovery_codes_verification' AND expires_at > NOW()");
+  $stmt->bind_param("s", $token);
+  $stmt->execute();
+  $result = $stmt->get_result();
+  $verified = $result->fetch_assoc();
+  $stmt->close();
 
-// 連携チェックをする関数
-$sso_query = "SELECT SSO FROM users WHERE id = ?";
-$stmt = $mysqli->prepare($sso_query);
-$stmt->bind_param("i", $user_id);
-$stmt->execute();
-$stmt->bind_result($SSO);
-$stmt->fetch();
-$stmt->close();
-$form_disabled = ($SSO === 'Google' || $SSO === 'GitHub');
+  if ($verified) {
+    // Recovery codesを取得
+    $stmt = $mysqli->prepare("SELECT recovery_codes FROM users_factor WHERE username = ?");
+    if ($stmt === false) {
+      die('Prepare statement failed: ' . $mysqli->error);
+    }
+    $stmt->bind_param("s", $username);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $recovery_data = $result->fetch_assoc();
+    $recovery_codes_json = $recovery_data['recovery_codes'];
+    $stmt->close();
 
-// アイコンが設定されていない場合の代わりのアイコンのURLを設定
-$default_icon = '/@/default.webp';
-$icon_path = !empty($icon_path) && file_exists($_SERVER['DOCUMENT_ROOT'] . $icon_path) ? $icon_path : $default_icon;
+    if (empty($recovery_codes_json)) {
+      header("Location: ../?error=二段階認証が設定されていません。");
+      exit();
+    }
 
-// フォームが送信された場合の処理
-if ($_SERVER["REQUEST_METHOD"] == "POST") {
+    $recovery_codes = json_decode($recovery_codes_json, true);
+    if (!$recovery_codes || !is_array($recovery_codes)) {
+      header("Location: ../?error=二段階認証が設定されていません。");
+      exit();
+    }
+  } else {
+    header("Location: /auth/recovery-codes/");
+    exit();
+  }
+} else {
+  header("Location: /auth/recovery-codes/");
+  exit();
+}
+
+// POSTリクエストの処理
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   // CSRFトークン検証
   if (
     !isset($_POST['csrf_token']) ||
@@ -176,86 +200,24 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     !isset($_SESSION['csrf_token_time']) ||
     time() - $_SESSION['csrf_token_time'] > CSRF_TOKEN_EXPIRE
   ) {
-    header("Location: /login?error=" . urlencode('無効なリクエストです。'));
+    header("Location: /security/recovery-codes?error=" . urlencode('無効なリクエストです。'));
     exit();
   }
-  $new_name = $_POST['name'];
 
-  // ユーザー名の検証
-  if (empty($new_name)) {
-    $error_message = "ユーザー名が入力されていません。";
-  } elseif (strlen($new_name) > 50 || strlen($new_name) < 3) {
-    $error_message = "ユーザー名は3文字以上50文字未満で入力してください。";
-  } else {
-    if (isset($_FILES['icon']) && $_FILES['icon']['error'] === UPLOAD_ERR_OK) {
-      $file_tmp = $_FILES['icon']['tmp_name'];
-      $file_name = $username . '.webp';
-      $destination = $_SERVER['DOCUMENT_ROOT'] . '/@/icons/' . $file_name;
+  // 新しいRecovery codesを生成
+  $new_recovery_codes = generateRecoveryCodes();
+  $new_recovery_codes_json = json_encode($new_recovery_codes);
 
-      if ($_FILES['icon']['size'] > 5 * 1024 * 1024) {
-        $error_message = "ファイルサイズは5MBを超えてはいけません";
-      } else {
-        if (file_exists($destination)) {
-          unlink($destination);
-        }
-        $image = imagecreatefromstring(file_get_contents($file_tmp));
-        if ($image !== false) {
-          if (imagewebp($image, $destination)) {
-            imagedestroy($image);
-
-            $icon_path = '/@/icons/' . $file_name;
-
-            $update_icon_query = "UPDATE users SET icon_path = ? WHERE id = ?";
-            $update_icon_stmt = $mysqli->prepare($update_icon_query);
-            $update_icon_stmt->bind_param("si", $icon_path, $user_id);
-            if ($update_icon_stmt->execute()) {
-              $message = "アイコンが更新されました";
-              $success = true;
-            } else {
-              $error_message = "データベース更新に失敗しました: " . $update_icon_stmt->error;
-            }
-            $update_icon_stmt->close();
-          } else {
-            $error_message = "画像の保存に失敗しました";
-          }
-        } else {
-          $error_message = "画像のアップロードに失敗しました";
-        }
-      }
-    }
-
-    // 名前を暗号化して保存
-    $encrypted_name = encryptUsername($new_name, $private_id);
-    $update_query = "UPDATE users SET name = ? WHERE id = ?";
-    $update_stmt = $mysqli->prepare($update_query);
-    $update_stmt->bind_param("si", $encrypted_name, $user_id);
-    $update_stmt->execute();
-    $update_stmt->close();
-
-    // 更新された情報を取得し直す
-    $query = "SELECT username, name, notifications, created_at, private_id FROM users WHERE id = ?";
-    $stmt = $mysqli->prepare($query);
-    $stmt->bind_param("i", $userId);
-    $stmt->execute();
-    $stmt->bind_result($username, $encrypted_name, $notifications, $created_at, $private_id);
-    $stmt->fetch();
-    $stmt->close();
-
-    // 名前を複合化
-    $name = decryptUsername($encrypted_name, $private_id);
-
-    if (!isset($error_message)) {
-      $message = "情報が更新されました。";
-      $success = true;
-    }
+  // データベースに新しいリカバリーコードを保存
+  $stmt = $mysqli->prepare("UPDATE users_factor SET recovery_codes = ? WHERE username = ?");
+  if ($stmt === false) {
+    die('Prepare statement failed: ' . $mysqli->error);
   }
+  $stmt->bind_param("ss", $new_recovery_codes_json, $username);
+  $stmt->execute();
+  $stmt->close();
 
-  // 結果に応じてリダイレクト
-  if (isset($success) && $success) {
-    header("Location: ?success=1");
-  } else {
-    header("Location: ?error=" . urlencode($error_message));
-  }
+  header("Location: ./?success=1");
   exit();
 }
 
@@ -288,134 +250,56 @@ $mysqli->close();
 
 <head>
   <meta charset="UTF-8">
-  <title>Profile｜Zisty</title>
+  <title>Recovery Codes｜Security｜Zisty</title>
   <meta name="keywords" content=" Zisty,ジスティー">
   <meta name="description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="copyright" content="Copyright &copy; 2024 Zisty. All rights reserved." />
   <!-- OGP Meta Tags -->
-  <meta property="og:title" content="Profile" />
+  <meta property="og:title" content="Recovery Codes" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://accounts.zisty.net/" />
   <meta property="og:image" content="https://accounts.zisty.net/images/header.jpg" />
-  <meta property="og:description" content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?" />
+  <meta property="og:description"
+    content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?" />
   <meta property="og:site_name" content="Zisty Accounts" />
   <meta property="og:locale" content="ja_JP" />
   <!-- Twitter Card Meta Tags (if needed) -->
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:site" content="@teamzisty">
   <meta name="twitter:creator" content="@teamzisty" />
-  <meta name="twitter:title" content="Profile / Zisty Accounts">
-  <meta name="twitter:description" content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
+  <meta name="twitter:title" content="Recovery Codes / Zisty Accounts">
+  <meta name="twitter:description"
+    content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="twitter:image" content="https://accounts.zisty.net/images/header.jpg">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <link rel="shortcut icon" type="image/x-icon" href="/favicon.png">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
-  <script src="https://www.google.com/recaptcha/api.js?render=6LdKgkgqAAAAADJkj3xBqXPpJBy0US_zj8siyx1w"></script>
   <script>
     const timeStamp = new Date().getTime();
     document.write('<link rel="stylesheet" href="https://accounts.zisty.net/css/style.css?time=' + timeStamp + '">');
   </script>
   <style>
-    /* Profile */
-    .input-button-group {
+    .lists {
+      border-radius: 15px;
+      padding: 20px;
+      max-width: 400px;
       display: flex;
-      align-items: center;
+      justify-content: space-between;
+      margin: 0 auto;
+    }
+
+    .list ul {
+      padding: 10px 0px 0px 20px;
+    }
+
+    .list li {
       margin-bottom: 15px;
-    }
-
-    .input-button-group input {
-      flex-grow: 1;
-      margin-bottom: 0;
-    }
-
-    .input-button-group button {
-      margin-left: 10px;
-      margin-top: 0;
-      height: 38px;
-      width: 50px;
-      margin-bottom: -5px;
-      border: 1px solid #dcdcdc67;
-      background-color: #111111;
-      color: #979797;
-      transition: 0.3s;
-    }
-
-    .input-button-group button:hover {
-      transform: scale(1.00);
-      background-color: #0e0f0f;
-    }
-
-    .input-button-group button:disabled {
-      cursor: not-allowed;
-    }
-
-
-    .eyes {
-      font-size: 12px;
-      margin-bottom: -7px;
-      color: #dcdcdc67;
-    }
-
-    .eves i {
-      margin-right: 4px;
-    }
-
-    .icon-container {
       position: relative;
-      display: inline-block;
-      margin-bottom: 10px;
-    }
-
-    .user_icon {
-      width: 80px;
-      height: 80px;
-      border-radius: 50%;
-      box-shadow: 0 0px 25px 0 rgba(58, 58, 58, 0.5);
-      transition: opacity 0.3s ease;
-      cursor: pointer;
-    }
-
-    .icon-container i {
-      position: absolute;
-      transform: translateX(-100%);
-      font-size: 24px;
-      color: #ffffff83;
-      opacity: 0;
-      transition: opacity 0.3s ease;
-      pointer-events: none;
-    }
-
-    .icon-container:hover .user_icon {
-      opacity: 0.6;
-    }
-
-    .icon-container:hover i {
-      opacity: 1;
-    }
-
-    .tag-container {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: left;
-      margin-top: 10px;
-      margin-bottom: 15px;
-    }
-
-    .tag {
-      background-color: #d4d4d400;
-      border: 1px solid #ffffff4d;
-      color: #797979;
-      padding: 5px 10px;
-      margin-right: 8px;
-      border-radius: 20px;
-      font-size: 12px;
-    }
-
-    .tag i {
-      font-size: 14px;
-      margin-right: 3px;
+      line-height: 1.6;
+      color: #bebebe;
+      font-size: 20px;
     }
   </style>
   <script>
@@ -423,7 +307,13 @@ $mysqli->close();
       const urlParams = new URLSearchParams(window.location.search);
 
       if (urlParams.get('success') === '1') {
-        showDialog("正常に保存されました！");
+        showDialog("正常に発行されました！");
+
+        const successSection = document.querySelector('.success');
+        if (successSection) {
+          successSection.style.display = 'block';
+        }
+
         const iconElement = document.getElementById('user-icon');
         if (iconElement) {
           const iconUrl = iconElement.src;
@@ -481,8 +371,8 @@ $mysqli->close();
       <h2 class="category-title">Personal</h2>
       <ul class="nav-list" role="menu">
         <a href="/" class="nav-link">
-          <li class="nav-item koko" role="menuitem">
-            <i class="bi bi-person-fill"></i>
+          <li class="nav-item" role="menuitem">
+            <i class="bi bi-person"></i>
             <span>Profile</span>
           </li>
         </a>
@@ -515,8 +405,8 @@ $mysqli->close();
           </li>
         </a>
         <a href="/security/" class="nav-link">
-          <li class="nav-item" role="menuitem">
-            <i class="bi bi-shield-lock"></i>
+          <li class="nav-item koko" role="menuitem">
+            <i class="bi bi-shield-lock-fill"></i>
             <span>Security</span>
           </li>
         </a>
@@ -561,44 +451,51 @@ $mysqli->close();
     </nav>
 
     <div class="content">
-      <h2>プロフィール</h2>
-      <form method="post" action="" id="profile-form" onsubmit="return validateAuthForm()" enctype="multipart/form-data">
-        <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
-        <input type="hidden" name="g-recaptcha-response" id="g-recaptcha-response">
+      <section class="success" style="background-color: #b3ff0005; border: 1px solid #d0ff001f; padding: 0px 20px; display: none;">
+        <p>新しいRecovery codeが正常に発行されました。これらのRecovery codeは安全な場所に保管し、以前のコードは破棄してください。</p>
+      </section>
 
-        <div class="icon-container"><img src="<?php echo htmlspecialchars($icon_path) . '?v=' . time(); ?>" class="user_icon" id="userIcon" onclick="document.getElementById('icon').click();"><input type="file" id="icon" name="icon" style="display: none;" accept="image/*" onchange="previewIcon(event)"><i class="fa-regular fa-pen-to-square"></i></div>
-        <script>
-          function previewIcon(event) {
-            const file = event.target.files[0];
-            if (file) {
-              if (file.size > 5 * 1024 * 1024) {
-                showDialog("画像のサイズが5MBをオーバーしてしまいました。");
-                event.target.value = '';
-                return;
+      <section>
+        <h2>Recovery codes</h2>
+        <p>デバイスへログインできなくなり、二段階認証コードを確認できない場合にRecovery codeを使用してアカウントにアクセスすることができます。</p>
+        <p>Recovery codeは安全な場所に保管してください。これらのコードがわからない場合、アカウントにアクセスできなくなります。</p>
+        <div class="lists">
+          <div class="list">
+            <ul>
+              <?php
+              $total_codes = count($recovery_codes);
+              $half = ceil($total_codes / 2);
+              for ($i = 0; $i < $half; $i++) {
+                if (isset($recovery_codes[$i])) {
+                  echo '<li>' . htmlspecialchars($recovery_codes[$i]) . '</li>';
+                }
               }
-              const reader = new FileReader();
-              reader.onload = function(e) {
-                document.getElementById('userIcon').src = e.target.result;
-              };
-              reader.readAsDataURL(file);
-            }
-          }
-        </script>
+              ?>
+            </ul>
+          </div>
+          <div class="list">
+            <ul>
+              <?php
+              for ($i = $half; $i < $total_codes; $i++) {
+                if (isset($recovery_codes[$i])) {
+                  echo '<li>' . htmlspecialchars($recovery_codes[$i]) . '</li>';
+                }
+              }
+              ?>
+            </ul>
+          </div>
+        </div>
+      </section>
 
-        <label for="username">ユーザー名</label>
-        <input type="text" id="username" name="username" style="pointer-events: none;" value="<?php echo htmlspecialchars($username); ?>" required>
-
-        <label for="name">名前</label>
-        <input type="text" id="name" name="name" value="<?php echo htmlspecialchars($name); ?>" required>
-
-        <label for="date">作成日</label>
-        <input type="text" id="date" name="date" style="pointer-events: none;" value="<?php echo htmlspecialchars($created_at); ?>" required>
-
-        <p class="eyes"><i class="bi bi-eye"></i> これらの情報は他のユーザーから見られる可能性があります。</p>
-        <br>
-
-        <button type="submit" id="submitBtn" class="btn btn-primary">送信</button>
+      <form method="POST" action="" id="recovery-codes-form">
+        <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+        <section>
+          <h2>新たに生成する</h2>
+          <p>新しいRecovery codeを生成します。新たに生成してしまうと古いコードは使用できなくなってしまいます。</p>
+          <button type="submit" class="settings-btn">新たに生成する</button>
+        </section>
       </form>
+
     </div>
   </main>
 

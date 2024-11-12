@@ -1,5 +1,5 @@
 <?php
-// セッション設定
+// セッション設定の強化
 ini_set('session.cookie_httponly', 1);
 ini_set('session.use_only_cookies', 1);
 ini_set('session.cookie_secure', 1);
@@ -115,31 +115,118 @@ if ($last_login_at) {
   exit();
 }
 
-// ユーザー名を取得
-$user_id = $_SESSION["user_id"];
-$query = "SELECT username, two_factor_enabled FROM users WHERE id = ?";
-$stmt = $mysqli->prepare($query);
+// ユーザーが既に削除リクエストを送信しているかチェック
+$stmt = $mysqli->prepare("SELECT * FROM users_verification WHERE user_id = ?  AND type = 'deactivate_verification' AND expires_at > NOW()");
 $stmt->bind_param("i", $user_id);
 $stmt->execute();
-$stmt->bind_result($username, $two_factor_enabled);
-$stmt->fetch();
+$result = $stmt->get_result();
+$existing_request = $result->fetch_assoc();
 $stmt->close();
 
-// デバイス情報を取得
-$query = "SELECT ip_address, last_login_at, created_at FROM users_session WHERE username = ? ORDER BY created_at DESC";
-$stmt = $mysqli->prepare($query);
-$stmt->bind_param("s", $username);
-$stmt->execute();
-$stmt->bind_result($ip_address, $last_login_at, $created_at);
-$devices = [];
-while ($stmt->fetch()) {
-  $devices[] = [
-    'ip_address' => $ip_address,
-    'last_login_at' => $last_login_at,
-    'created_at' => $created_at
-  ];
+// 定義関数
+$request_status = '';
+
+// フォームが送信されたときの処理
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+  // CSRFトークン検証
+  if (
+    !isset($_POST['csrf_token']) ||
+    !isset($_SESSION['csrf_token']) ||
+    !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token']) ||
+    !isset($_SESSION['csrf_token_time']) ||
+    time() - $_SESSION['csrf_token_time'] > CSRF_TOKEN_EXPIRE
+  ) {
+    header("Location: /admin?error=" . urlencode('無効なリクエストです。'));
+    exit();
+  }
+
+  // 既存の検証エントリを削除
+  $stmt = $mysqli->prepare("DELETE FROM users_verification WHERE user_id = ? AND type = 'deactivate_verification'");
+  $stmt->bind_param("i", $user_id);
+  $stmt->execute();
+  $stmt->close();
+
+  // ユーザー情報を取得
+  $query = "SELECT username, name, two_factor_secret, email FROM users WHERE id = ?";
+  $stmt = $mysqli->prepare($query);
+  $stmt->bind_param("i", $user_id);
+  $stmt->execute();
+  $stmt->bind_result($username, $name, $two_factor_secret, $email);
+  $stmt->fetch();
+  $stmt->close();
+
+  // emailが取得できているか確認
+  if (empty($email)) {
+    $request_status = 'not';
+
+    // 既存の検証エントリを削除
+    $stmt = $mysqli->prepare("DELETE FROM users_verification WHERE user_id = ? AND type = 'deactivate_verification'");
+    $stmt->bind_param("i", $user_id);
+    $stmt->execute();
+    $stmt->close();
+  }
+
+  // トークンを生成
+  $token = bin2hex(random_bytes(32));
+  $expires_at = (new DateTime())->add(new DateInterval('PT10M'))->format('Y-m-d H:i:s');
+
+  // テーブルにエントリを挿入
+  $stmt = $mysqli->prepare("INSERT INTO users_verification (user_id, token, expires_at, email, type, created_at) VALUES (?, ?, ?, ?, 'deactivate_verification', NOW())");
+  $stmt->bind_param("isss", $user_id, $token, $expires_at, $email);
+  $stmt->execute();
+  $stmt->close();
+
+  // 認証リンクの作成
+  $verify_link = "https://accounts.zisty.net/auth/deactivate/?token=" . $token;
+
+  // メール送信
+  $to = $email;
+  $subject = "アカウント削除リクエストの確認";
+  $message = "
+                <html>
+                <head>
+                  <title>メールアドレスの認証｜Zisty</title>
+                </head>
+                <body>
+                  <p>" . $username . " 様</p>
+                  <p>アカウントの削除がリクエストされました。アカウントを削除するには、次のリンクをクリックしてください。</p>
+                  <a href='" . $verify_link . "'>" . $verify_link . "</a>
+                  <p>このリクエストを依頼していない場合は、このメールを無視してください。</p>
+                  <p>よろしくお願い致します。</p>
+                  <p>TeamZisty / Zisty Accounts</p>
+                </body>
+                </html>
+          ";
+
+  // ヘッダー
+  $headers = "MIME-Version: 1.0" . "\r\n";
+  $headers .= "Content-type:text/html;charset=UTF-8" . "\r\n";
+  $headers .= "From: Zisty Accounts <no-reply@zisty.net>" . "\r\n";
+  $headers .= 'X-Mailer: PHP/' . phpversion();
+
+  if (mail($email, $subject, $message, $headers)) {
+    $request_status = 'sent';
+  } else {
+    $request_status = 'failed';
+    // 既存の検証エントリを削除
+    $stmt = $mysqli->prepare("DELETE FROM users_verification WHERE user_id = ? AND type = 'deactivate_verification'");
+    $stmt->bind_param("i", $user_id);
+    $stmt->execute();
+    $stmt->close();
+  }
+
+  // 結果に応じてリダイレクト
+  if (isset($success) && $success) {
+    header("Location: ?success=1");
+  } else {
+    header("Location: ?error=" . urlencode($error_message));
+  }
+  exit();
 }
-$stmt->close();
+
+// CSRFトークンの生成
+$_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+$_SESSION['csrf_token_time'] = time();
 
 $mysqli->close();
 ?>
@@ -166,13 +253,13 @@ $mysqli->close();
 
 <head>
   <meta charset="UTF-8">
-  <title>Security｜Zisty</title>
+  <title>Account｜Zisty</title>
   <meta name="keywords" content=" Zisty,ジスティー">
   <meta name="description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="copyright" content="Copyright &copy; 2024 Zisty. All rights reserved." />
   <!-- OGP Meta Tags -->
-  <meta property="og:title" content="Security" />
+  <meta property="og:title" content="Account" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://accounts.zisty.net/" />
   <meta property="og:image" content="https://accounts.zisty.net/images/header.jpg" />
@@ -184,7 +271,7 @@ $mysqli->close();
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:site" content="@teamzisty">
   <meta name="twitter:creator" content="@teamzisty" />
-  <meta name="twitter:title" content="Security / Zisty Accounts">
+  <meta name="twitter:title" content="Account / Zisty Accounts">
   <meta name="twitter:description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="twitter:image" content="https://accounts.zisty.net/images/header.jpg">
@@ -196,26 +283,6 @@ $mysqli->close();
     const timeStamp = new Date().getTime();
     document.write('<link rel="stylesheet" href="https://accounts.zisty.net/css/style.css?time=' + timeStamp + '">');
   </script>
-  <style>
-    .settings-btn {
-      font-size: 14px;
-      padding: 10px 25px;
-      margin-right: 10px;
-      border: none;
-      background-color: #1b1b1b;
-      color: #cfcfcf;
-      border: 1px solid #414141;
-      border-radius: 3px;
-      cursor: pointer;
-      margin-top: 0;
-      min-width: 80px;
-    }
-
-    .settings-btn:hover {
-      border: 1px solid #636363;
-      background-color: #1b1b1b;
-    }
-  </style>
 </head>
 
 <body>
@@ -257,8 +324,8 @@ $mysqli->close();
           </li>
         </a>
         <a href="/admin/" class="nav-link">
-          <li class="nav-item" role="menuitem">
-            <i class="bi bi-gear"></i>
+          <li class="nav-item koko" role="menuitem">
+            <i class="bi bi-gear-fill"></i>
             <span>Account</span>
           </li>
         </a>
@@ -285,8 +352,8 @@ $mysqli->close();
           </li>
         </a>
         <a href="/security/" class="nav-link">
-          <li class="nav-item koko" role="menuitem">
-            <i class="bi bi-shield-lock-fill"></i>
+          <li class="nav-item" role="menuitem">
+            <i class="bi bi-shield-lock"></i>
             <span>Security</span>
           </li>
         </a>
@@ -331,51 +398,33 @@ $mysqli->close();
     </nav>
 
     <div class="content">
-      <section>
-        <h2>パスワード</h2>
-        <p>パスワードを変更することができます。パスワードを変更すると全デバイスからログアウトされてしまいますのでご注意ください。</p>
+      <section style="background-color: #ff2f0005;">
+        <h2 style="color: #fc8a84;">アカウントの削除</h2>
+        <p>アカウントの削除は永久的なものであり、復元することはできません。削除するとログインはもちろん、連携サービスの利用や連携サービスを使用したデータなども使えなくなってしまいます。</p>
 
-        <button onclick="window.location.href='password/'"">パスワードを変更する</button>
+        <?php if ($existing_request): ?>
+          <section style="background-color: #271511; border: 1px solid #352521; padding: 0px 20px; margin: 0;">
+            <p>アカウント削除リクエストは既に送信されています。</p>
+          </section>
+        <?php elseif ($request_status === 'sent'): ?>
+          <section style="background-color: #271511; border: 1px solid #352521; padding: 0px 20px; margin: 0;">
+            <p>登録されているメールアドレスへ確認URLを送信しました。</p>
+          </section>
+        <?php elseif ($request_status === 'failed'): ?>
+          <section style="background-color: #271511; border: 1px solid #352521; padding: 0px 20px; margin: 0;">
+            <p>メールの送信に失敗しました。しばらくしてからもう一度お試しください。</p>
+          </section>
+        <?php elseif ($request_status === 'not'): ?>
+          <section style="background-color: #271511; border: 1px solid #352521; padding: 0px 20px; margin: 0;">
+            <p>メールアドレスが設定されていません。設定してからもう一度お試しください。</p>
+          </section>
+        <?php else: ?>
+          <form id="deactivation-form" method="post" action="">
+            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+            <button class="button-warning">アカウントの削除をリクエストする</button>
+          </form>
+        <?php endif; ?>
       </section>
-
-      <section>
-        <h2>二段階認証</h2>
-        <p>二段階認証を設定することでログイン時にパスワードのほかに新たな要素も要求されるため、アカウントのセキュリティを強化することができます。</p>
-        
-        <h3>二要素方式</h3>
-        <div class=" link">
-          <i class="bi bi-phone"></i>
-          <div class="content">
-            <h2 class="title">2段階認証アプリ</h2>
-            <p>2段階認証(2FA)として認証アプリを使用します。 サインインの際に、認証アプリにより提供されるセキュリティコードが必要になります。</p>
-          </div>
-          <?php if ($two_factor_enabled == 0): ?>
-            <button onclick="window.location.href='app/'" class="settings-btn">設定</button>
-          <?php else: ?>
-            <button onclick="window.location.href='app/'" class="release-btn">解除</button>
-          <?php endif; ?>
-    </div>
-
-    <h3>回復オプション</h3>
-    <div class=" link">
-      <i class="bi bi-key"></i>
-      <div class="content">
-        <h2 class="title">Recovery codes</h2>
-        <p>デバイスへログインできなくなり、二段階認証コードを確認できない場合にRecovery codeを使用してアカウントにアクセスすることができます。</p>
-      </div>
-      <?php if ($two_factor_enabled == 0): ?>
-        <button onclick="window.location.href='recovery-codes/'" class="settings-btn">見る</button>
-      <?php else: ?>
-        <button onclick="" class="invalid-btn">見る</button>
-      <?php endif; ?>
-    </div>
-    </section>
-
-    <section style="background-color: #ff2f0005;">
-      <h2 style="color: #fc8a84;">全てのデバイスからログアウト</h2>
-      <p>ログインしている全てのデバイスからログアウトすることができます。ログアウトしたデバイスでは、もう一度ログインし直す必要があります。</p>
-      <button onclick="window.location.href='/API/all.logout.php'" class="button-warning">全てのデバイスからログアウト</button>
-    </section>
     </div>
   </main>
 

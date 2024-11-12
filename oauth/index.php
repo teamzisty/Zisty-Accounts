@@ -1,8 +1,216 @@
+<?php
+session_start();
+$userId = $_SESSION['user_id'];
+
+// データベース接続
+$mysqli = new mysqli("", "", "", "");
+if ($mysqli->connect_error) {
+  die('データベースの接続に失敗しました: ' . $mysqli->connect_error);
+}
+
+$currentUrl = "https://" . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
+$client_id = isset($_GET['client_id']) ? $_GET['client_id'] : '';
+$service_data = [];
+
+// ログイン状態の確認
+if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
+  $ip_address = $_SERVER['HTTP_CLIENT_IP'];
+} elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+  $x_forwarded_for = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+  $ip_address = trim($x_forwarded_for[0]);
+} else {
+  $ip_address = $_SERVER['REMOTE_ADDR'];
+}
+
+if (isset($_SESSION["user_id"])) {
+  $user_id = $_SESSION["user_id"];
+  $session_id = session_id();
+
+  $stmt = $mysqli->prepare("SELECT last_login_at, ip_address FROM users_session WHERE session_id = ? AND username = (SELECT username FROM users WHERE id = ?)");
+  if ($stmt === false) {
+    die('Prepare statement failed: ' . $mysqli->error);
+  }
+  $stmt->bind_param("si", $session_id, $user_id);
+  $stmt->execute();
+  $stmt->bind_result($last_login_at, $session_ip_address);
+  $stmt->fetch();
+  $stmt->close();
+
+  if ($last_login_at && $session_ip_address === $ip_address) {
+    $current_time = new DateTime();
+    $last_login_time = new DateTime($last_login_at);
+    $interval = $current_time->diff($last_login_time);
+    if ($interval->days >= 3) {
+      session_unset();
+      session_destroy();
+      header("Location: /login/?auth=" . urlencode($client_id));
+      exit();
+    } else {
+      $stmt = $mysqli->prepare("UPDATE users_session SET last_login_at = NOW() WHERE session_id = ?");
+      if ($stmt === false) {
+        die('Prepare statement failed: ' . $mysqli->error);
+      }
+      $stmt->bind_param("s", $session_id);
+      $stmt->execute();
+      $stmt->close();
+    }
+  } else {
+    session_unset();
+    session_destroy();
+    header("Location: /login/?auth=" . urlencode($client_id));
+    exit();
+  }
+} else {
+  header("Location: /login/?auth=" . urlencode($client_id));
+  exit();
+}
+
+// ユーザー情報を取得
+$query = "SELECT username, email, two_factor_secret FROM users WHERE id = ?";
+$stmt = $mysqli->prepare($query);
+$stmt->bind_param("i", $user_id);
+$stmt->execute();
+$stmt->bind_result($username, $email, $two_factor_secret);
+$stmt->fetch();
+$stmt->close();
+
+if (empty($email)) {
+  header("Location: /profile/email/");
+  exit();
+}
+
+// client_idからサービスの取得
+if (!empty($client_id)) {
+  $stmt = $mysqli->prepare("SELECT icon_url, name, description, Authentication_URL, Terms_URL, Privacy_URL, Service_URL FROM link_services WHERE service_id = ?");
+  if ($stmt) {
+    $stmt->bind_param("s", $client_id);
+    $stmt->execute();
+    $stmt->bind_result($icon_url, $name, $description, $auth_url, $terms_url, $privacy_url, $service_url);
+
+    if ($stmt->fetch()) {
+      $service_data = [
+        'icon_url' => $icon_url,
+        'name' => $name,
+        'description' => $description,
+        'auth_url' => $auth_url,
+        'terms_url' => $terms_url,
+        'privacy_url' => $privacy_url,
+        'service_url' => $service_url,
+      ];
+    }
+
+    $stmt->close();
+  }
+}
+
+//public_id
+$stmt = $mysqli->prepare("SELECT public_id FROM users WHERE id = ?");
+$stmt->bind_param("i", $userId);
+$stmt->execute();
+$stmt->bind_result($public_id);
+$stmt->fetch();
+$stmt->close();
+
+// サービスが既にリンクされているか確認
+$check_stmt = $mysqli->prepare("SELECT COUNT(*) FROM link_accounts WHERE user_id = ? AND service_id = ?");
+$check_stmt->bind_param("ss", $userId, $client_id);
+$check_stmt->execute();
+$check_stmt->bind_result($count);
+$check_stmt->fetch();
+$check_stmt->close();
+
+// サービスが既にリンクされている場合
+if ($count > 0) {
+  $password = bin2hex(random_bytes(32));
+  $encryption_key = bin2hex(random_bytes(16));
+  $iv = random_bytes(16);
+  $encrypted_token = openssl_encrypt($password, 'aes-256-cbc', hex2bin($encryption_key), 0, $iv);
+  $encrypted_token = base64_encode($iv . $encrypted_token);
+  $update_stmt = $mysqli->prepare("UPDATE link_accounts SET one_time_password = ? WHERE user_id = ? AND service_id = ?");
+  if ($update_stmt) {
+    $update_stmt->bind_param("sss", $password, $userId, $client_id);
+    $update_stmt->execute();
+    if ($update_stmt->affected_rows > 0) {
+      $update_stmt->close();
+      $redirect_url = $service_data['auth_url'] . "?token=" . urlencode($encrypted_token) . urlencode($encryption_key);
+      header("Location: $redirect_url");
+      exit();
+    } else {
+      echo 'ワンタイムパスワードの更新に失敗しました。';
+    }
+  } else {
+    die('Prepare failed: ' . $mysqli->error);
+  }
+} else {
+}
+
+// POST リクエストが送信された場合はサービスを追加
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  // 既にサービスがリンクされていないか確認
+  $check_stmt = $mysqli->prepare("SELECT COUNT(*), link_id, one_time_password FROM link_accounts WHERE user_id = ? AND service_id = ?");
+  $check_stmt->bind_param("ss", $public_id, $client_id);
+  $check_stmt->execute();
+  $check_stmt->bind_result($count, $existing_link_id, $existing_password);
+  $check_stmt->fetch();
+  $check_stmt->close();
+
+  if ($count === 0) {
+    // 新規のサービス追加
+    $link_id = str_pad(mt_rand(0, 999999999999999999), 18, '0', STR_PAD_LEFT);
+    $password = bin2hex(random_bytes(32));
+    $encryption_key = bin2hex(random_bytes(16));
+    $iv = random_bytes(16);
+    $encrypted_token = openssl_encrypt($password, 'aes-256-cbc', hex2bin($encryption_key), 0, $iv);
+    $encrypted_token = base64_encode($iv . $encrypted_token);
+
+    $insert_stmt = $mysqli->prepare("INSERT INTO link_accounts (user_id, service_id, link_id, one_time_password) VALUES (?, ?, ?, ?)");
+    if ($insert_stmt) {
+      $insert_stmt->bind_param("ssss", $public_id, $client_id, $link_id, $encrypted_token);
+      $insert_stmt->execute();
+      $insert_stmt->close();
+
+      // リダイレクトURLの生成と送信
+      $redirect_url = $service_data['auth_url'] . "?token=" . urlencode($encrypted_token) . urlencode($encryption_key);
+      header("Location: $redirect_url");
+      exit();
+    } else {
+      die('Prepare failed: ' . $mysqli->error);
+    }
+  } else {
+    // ワンタイムパスワードを再発行して更新
+    $new_password = bin2hex(random_bytes(32));
+    $new_encryption_key = bin2hex(random_bytes(16));
+    $iv = random_bytes(16);
+    $new_encrypted_token = openssl_encrypt($new_password, 'aes-256-cbc', hex2bin($new_encryption_key), 0, $iv);
+    $new_encrypted_token = base64_encode($iv . $new_encrypted_token);
+
+    $update_stmt = $mysqli->prepare("UPDATE link_accounts SET one_time_password = ? WHERE user_id = ? AND service_id = ?");
+    if ($update_stmt) {
+      $update_stmt->bind_param("sss", $new_password, $public_id, $client_id);
+      $update_stmt->execute();
+      $update_stmt->close();
+
+      // リダイレクトURLの生成と送信
+      $redirect_url = $service_data['auth_url'] . "?token=" . urlencode($new_encrypted_token) . urlencode($new_encryption_key);
+      header("Location: $redirect_url");
+      exit();
+    } else {
+      die('Prepare failed: ' . $mysqli->error);
+    }
+  }
+}
+
+$previous_page = isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : $service_url;
+
+$mysqli->close();
+?>
+
 <!DOCTYPE html>
 <html lang="ja">
+
 <head>
   <meta charset="utf-8" />
-  <title>403｜Zisty</title>
+  <title>Authorize｜Zisty</title>
   <meta name="description" content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="copyright" content="Copyright &copy; 2024 Zisty. All rights reserved." />
   <meta property="og:title" content="Zisty Account - Authorize" />
@@ -17,8 +225,11 @@
   <meta name="twitter:site" content="accounts.zisty.net" />
   <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
   <link rel="shortcut icon" type="image/x-icon" href="/favicon.png">
-  <link rel="stylesheet" href="https://zisty.net/icon.css">
-  <link rel="stylesheet" href="https://zisty.net/header.css">
+  <script>
+    const timeStamp = new Date().getTime();
+    document.write('<link rel="stylesheet" href="https://zisty.net/icon.css?time=' + timeStamp + '">');
+    document.write('<link rel="stylesheet" href="https://zisty.net/css/main.css?time=' + timeStamp + '">');
+  </script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
   <style>
     body {
@@ -569,6 +780,11 @@
       text-decoration: underline solid #c8c3bc;
     }
   </style>
+  <script>
+    function account_error(message) {
+      alert(message);
+    }
+  </script>
 </head>
 
 <body>
@@ -602,19 +818,44 @@
   </div>
 
   <div class="center">
-      <form>
+    <?php if (!empty($service_data)): ?>
+      <form method="post" action="" onsubmit="return validateForm()">
         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
-        <img src="https://accounts.zisty.net/oauth/None.jpg" width="70px">
-        <h2>立ち入り禁止のようです</h2>
-        <p>申し訳ありませんが、あなたが要求したURLには制限がかかっており、アクセスできなくなっているようです。</p>
+        <img src="<?php echo htmlspecialchars($service_data['icon_url']); ?>" width="50px">
+        <h2>認証しますか？</h2>
+        <p><?php echo htmlspecialchars($service_data['name']); ?>がアカウントへのアクセスを要求しています。<br>続行すると名前、メールアドレス、言語設定、PublicIDが共有されます。<br><br>
+          <?php echo htmlspecialchars($service_data['name']); ?>の<a class="rules" target="_blank" href="<?php echo htmlspecialchars($service_data['privacy_url']); ?>">プライバシーポリシー</a>と<a class="rules" target="_blank" href="<?php echo htmlspecialchars($service_data['terms_url']); ?>">利用規約</a>をご覧ください。</br></p>
+
+        <?php
+        if (isset($_GET['error'])) {
+          echo '<p class="error-message">Error：' . htmlspecialchars($_GET['error'], ENT_QUOTES, 'UTF-8') . '</p>';
+        }
+        ?>
+
+        <div class="button-container">
+          <a href="<?php echo $previous_page ?>" class="styled-button" style="background-color: #333;">キャンセル</a>
+          <button class="styled-button">認証</button>
+        </div>
 
         <p class="tp"><a href="https://zisty.net/terms/" target="_blank">Tos</a>｜<a
             href="https://zisty.net/privacy/" target="_blank">Privacy</a></p>
       </form>
+    <?php else: ?>
+      <form>
+        <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+        <img src="None.jpg" width="70px">
+        <h2>道に迷いんでしまったようです</h2>
+        <p>あなたがリクエストしたサービスは存在しないまたは停止されている可能性があります。</p>
+
+        <p class="tp"><a href="https://zisty.net/terms/" target="_blank">Tos</a>｜<a
+            href="https://zisty.net/privacy/" target="_blank">Privacy</a></p>
+      </form>
+    <?php endif; ?>
   </div>
 
   <script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script>
   <script src="../Warning.js"></script>
+  <script src="/showDialog.js"></script>
   <script>
     window.addEventListener('load', function() {
       setTimeout(function() {
@@ -622,19 +863,6 @@
         loadingScreen.style.animation = 'fadeOut 1s ease forwards';
       }, 1000);
     });
-  </script>
-  <script>
-    function showLanguageDropdown() {
-      document.getElementById("languageDropdown").style.display = "block";
-    }
-
-    function hideLanguageDropdown() {
-      document.getElementById("languageDropdown").style.display = "none";
-    }
-
-    function keepLanguageDropdownVisible() {
-      document.getElementById("languageDropdown").style.display = "block";
-    }
   </script>
 </body>
 

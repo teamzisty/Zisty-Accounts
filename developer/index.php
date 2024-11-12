@@ -30,12 +30,15 @@ if (session_status() === PHP_SESSION_NONE) {
   session_start();
 }
 
-// データベース接続
+// データベースに接続
 $mysqli = new mysqli("", "", "", "");
-if ($mysqli->connect_error) {
-  die('データベースの接続に失敗しました: ' . $mysqli->connect_error);
+if ($mysqli->connect_errno) {
+  echo "データベースの接続に失敗しました: " . $mysqli->connect_error;
   exit();
 }
+
+// ユーザー情報を取得
+$user_id = $_SESSION["user_id"];
 
 // セッションのセキュリティチェック
 function validateSession()
@@ -115,64 +118,21 @@ if ($last_login_at) {
   exit();
 }
 
-// ユーザー名を取得
-$user_id = $_SESSION["user_id"];
-$query = "SELECT username, two_factor_enabled FROM users WHERE id = ?";
-$stmt = $mysqli->prepare($query);
-$stmt->bind_param("i", $user_id);
-$stmt->execute();
-$stmt->bind_result($username, $two_factor_enabled);
-$stmt->fetch();
-$stmt->close();
-
-// デバイス情報を取得
-$query = "SELECT ip_address, last_login_at, created_at FROM users_session WHERE username = ? ORDER BY created_at DESC";
-$stmt = $mysqli->prepare($query);
-$stmt->bind_param("s", $username);
-$stmt->execute();
-$stmt->bind_result($ip_address, $last_login_at, $created_at);
-$devices = [];
-while ($stmt->fetch()) {
-  $devices[] = [
-    'ip_address' => $ip_address,
-    'last_login_at' => $last_login_at,
-    'created_at' => $created_at
-  ];
-}
-$stmt->close();
-
 $mysqli->close();
 ?>
-
-<!--
-
- _______                           ______ _       _
-|__   __|                         |___  /(_)     | |
-   | |     ___   __ _  _ __ ___      / /  _  ___ | |_  _   _
-   | |    / _ \ / _` || '_ ` _ \    / /  | |/ __|| __|| | | |
-   | |   |  __/| (_| || | | | | |  / /__ | |\__ \| |_ | |_| |
-   |_|    \___| \__,_||_| |_| |_| /_____||_||___/ \__| \__, |
-                                                        __/ |
-                                                       |___/
-
- We are TeamZisty!
- If you are watching this, why don't you join our team?
- https://discord.gg/6BPfVm6cST
-
--->
 
 <!DOCTYPE html>
 <html lang="ja">
 
 <head>
   <meta charset="UTF-8">
-  <title>Security｜Zisty</title>
+  <title>Developer｜Zisty</title>
   <meta name="keywords" content=" Zisty,ジスティー">
   <meta name="description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="copyright" content="Copyright &copy; 2024 Zisty. All rights reserved." />
   <!-- OGP Meta Tags -->
-  <meta property="og:title" content="Security" />
+  <meta property="og:title" content=">Developer" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://accounts.zisty.net/" />
   <meta property="og:image" content="https://accounts.zisty.net/images/header.jpg" />
@@ -184,7 +144,7 @@ $mysqli->close();
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:site" content="@teamzisty">
   <meta name="twitter:creator" content="@teamzisty" />
-  <meta name="twitter:title" content="Security / Zisty Accounts">
+  <meta name="twitter:title" content=">Developer / Zisty Accounts">
   <meta name="twitter:description"
     content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="twitter:image" content="https://accounts.zisty.net/images/header.jpg">
@@ -197,23 +157,23 @@ $mysqli->close();
     document.write('<link rel="stylesheet" href="https://accounts.zisty.net/css/style.css?time=' + timeStamp + '">');
   </script>
   <style>
-    .settings-btn {
-      font-size: 14px;
-      padding: 10px 25px;
-      margin-right: 10px;
-      border: none;
-      background-color: #1b1b1b;
-      color: #cfcfcf;
-      border: 1px solid #414141;
-      border-radius: 3px;
-      cursor: pointer;
-      margin-top: 0;
-      min-width: 80px;
+    .content {
+      text-align: center;
     }
 
-    .settings-btn:hover {
-      border: 1px solid #636363;
-      background-color: #1b1b1b;
+    .content i {
+      font-size: 40px;
+      color: #cfcfcf;
+    }
+
+    .content h1 {
+      font-size: 40px;
+      color: #cfcfcf;
+      margin-top: 10px;
+    }
+
+    .content p {
+      color: #bebebe;
     }
   </style>
 </head>
@@ -285,8 +245,8 @@ $mysqli->close();
           </li>
         </a>
         <a href="/security/" class="nav-link">
-          <li class="nav-item koko" role="menuitem">
-            <i class="bi bi-shield-lock-fill"></i>
+          <li class="nav-item" role="menuitem">
+            <i class="bi bi-shield-lock"></i>
             <span>Security</span>
           </li>
         </a>
@@ -307,7 +267,7 @@ $mysqli->close();
           </li>
         </a>
         <a href="/developer/" class="nav-link">
-          <li class="nav-item" role="menuitem">
+          <li class="nav-item koko" role="menuitem">
             <i class="bi bi-code-slash"></i>
             <span>Developer</span>
           </li>
@@ -331,51 +291,9 @@ $mysqli->close();
     </nav>
 
     <div class="content">
-      <section>
-        <h2>パスワード</h2>
-        <p>パスワードを変更することができます。パスワードを変更すると全デバイスからログアウトされてしまいますのでご注意ください。</p>
-
-        <button onclick="window.location.href='password/'"">パスワードを変更する</button>
-      </section>
-
-      <section>
-        <h2>二段階認証</h2>
-        <p>二段階認証を設定することでログイン時にパスワードのほかに新たな要素も要求されるため、アカウントのセキュリティを強化することができます。</p>
-        
-        <h3>二要素方式</h3>
-        <div class=" link">
-          <i class="bi bi-phone"></i>
-          <div class="content">
-            <h2 class="title">2段階認証アプリ</h2>
-            <p>2段階認証(2FA)として認証アプリを使用します。 サインインの際に、認証アプリにより提供されるセキュリティコードが必要になります。</p>
-          </div>
-          <?php if ($two_factor_enabled == 0): ?>
-            <button onclick="window.location.href='app/'" class="settings-btn">設定</button>
-          <?php else: ?>
-            <button onclick="window.location.href='app/'" class="release-btn">解除</button>
-          <?php endif; ?>
-    </div>
-
-    <h3>回復オプション</h3>
-    <div class=" link">
-      <i class="bi bi-key"></i>
-      <div class="content">
-        <h2 class="title">Recovery codes</h2>
-        <p>デバイスへログインできなくなり、二段階認証コードを確認できない場合にRecovery codeを使用してアカウントにアクセスすることができます。</p>
-      </div>
-      <?php if ($two_factor_enabled == 0): ?>
-        <button onclick="window.location.href='recovery-codes/'" class="settings-btn">見る</button>
-      <?php else: ?>
-        <button onclick="" class="invalid-btn">見る</button>
-      <?php endif; ?>
-    </div>
-    </section>
-
-    <section style="background-color: #ff2f0005;">
-      <h2 style="color: #fc8a84;">全てのデバイスからログアウト</h2>
-      <p>ログインしている全てのデバイスからログアウトすることができます。ログアウトしたデバイスでは、もう一度ログインし直す必要があります。</p>
-      <button onclick="window.location.href='/API/all.logout.php'" class="button-warning">全てのデバイスからログアウト</button>
-    </section>
+      <i class="bi bi-code-slash"></i>
+      <h1>Developer</h1>
+      <p>今後リリース予定</p>
     </div>
   </main>
 

@@ -1,26 +1,111 @@
 <?php
-session_start();
+// ファイルの読み込み
+require 'libs/GoogleAuthenticator.php';
+require_once 'SSO/vendor/autoload.php';
+
+// セッション設定
+ini_set('session.cookie_httponly', 1);
+ini_set('session.use_only_cookies', 1);
+ini_set('session.cookie_secure', 1);
+ini_set('session.cookie_samesite', 'Strict');
+ini_set('session.gc_maxlifetime', 3600);
+ini_set('session.use_strict_mode', 1);
+ini_set('session.sid_length', 48);
+ini_set('session.sid_bits_per_character', 6);
+
+// セキュリティ定数
+define('MAX_LOGIN_ATTEMPTS', 5);
+define('LOGIN_LOCKOUT_TIME', 1800);
+define('CSRF_TOKEN_EXPIRE', 3600);
+define('SESSION_LIFETIME', 3600);
+
+// ヘッダー
+header("X-Frame-Options: DENY");
+header("X-XSS-Protection: 1; mode=block");
+header("X-Content-Type-Options: nosniff");
+header("Referrer-Policy: strict-origin-only");
+header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
+header("Cache-Control: no-cache, no-store, must-revalidate");
+header("Pragma: no-cache");
+header("Expires: 0");
+
+// データベース接続
 $mysqli = new mysqli("", "", "", "");
 if ($mysqli->connect_error) {
-    $error_message = ('Database connection error: ' . $mysqli->connect_error);
+    die('Database connection error: ' . $mysqli->connect_error);
 }
 
+// セッションIDの検証と再生成
+if (isset($_COOKIE[session_name()])) {
+    if (!preg_match('/^[a-zA-Z0-9,-]{48,96}$/', $_COOKIE[session_name()])) {
+        session_id(bin2hex(random_bytes(32)));
+    }
+}
+
+// セッション開始
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+// セッションの初期化
 if (!isset($_SESSION['initiated'])) {
     session_regenerate_id(true);
     $_SESSION['initiated'] = true;
 }
 
+// セッションのセキュリティチェック
+function validateSession()
+{
+    if (!isset($_SESSION['created_at'])) {
+        $_SESSION['created_at'] = time();
+    } else if (time() - $_SESSION['created_at'] > SESSION_LIFETIME) {
+        session_destroy();
+        return false;
+    }
+
+    if (!isset($_SESSION['user_ip'])) {
+        $_SESSION['user_ip'] = $_SERVER['REMOTE_ADDR'];
+    } else if ($_SESSION['user_ip'] !== $_SERVER['REMOTE_ADDR']) {
+        session_destroy();
+        return false;
+    }
+
+    if (!isset($_SESSION['user_agent'])) {
+        $_SESSION['user_agent'] = $_SERVER['HTTP_USER_AGENT'];
+    } else if ($_SESSION['user_agent'] !== $_SERVER['HTTP_USER_AGENT']) {
+        session_destroy();
+        return false;
+    }
+
+    if (!isset($_SESSION['last_regeneration'])) {
+        $_SESSION['last_regeneration'] = time();
+    } else if (time() - $_SESSION['last_regeneration'] > 300) {
+        session_regenerate_id(true);
+        $_SESSION['last_regeneration'] = time();
+    }
+
+    return true;
+}
+
+// ログインチェック
 if (isset($_SESSION["user_id"])) {
     $user_id = $_SESSION["user_id"];
     $session_id = session_id();
 
-    $stmt = $mysqli->prepare("SELECT last_login_at FROM users_session WHERE session_id = ? AND username = (SELECT username FROM users WHERE id = ?)");
-    if ($stmt === false) {
-        $error_message = ('Prepare statement failed: ' . $mysqli->error);
-    }
+    $stmt = $mysqli->prepare("
+    SELECT 
+        username, 
+        last_login_at 
+    FROM users_session 
+    WHERE session_id = ? AND username = (
+        SELECT username 
+        FROM users 
+        WHERE id = ?
+    )
+");
     $stmt->bind_param("si", $session_id, $user_id);
     $stmt->execute();
-    $stmt->bind_result($last_login_at);
+    $stmt->bind_result($username, $last_login_at);
     $stmt->fetch();
     $stmt->close();
 
@@ -39,102 +124,261 @@ if (isset($_SESSION["user_id"])) {
     }
 }
 
+// 既存のエラーメッセージの初期化
+$error_message = '';
+
+// GETパラメーターからエラーメッセージを取得
+if (isset($_GET['error'])) {
+    $error_message = htmlspecialchars($_GET['error'], ENT_QUOTES, 'UTF-8');
+}
+
+// 既存のエラーメッセージがある場合、JavaScriptでダイアログを表示
+if (!empty($error_message)) {
+    echo "<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        document.querySelector('.error-text').innerText = " . json_encode($error_message) . ";
+        document.querySelector('.error-container').style.display = 'flex';
+    });
+    </script>";
+}
+
+// POST リクエスト処理
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
-    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
-        $error_message = "認証に失敗しました。";
-    } else {
-        $username = trim($_POST["username"]);
+    // CSRFトークン検証
+    if (
+        !isset($_POST['csrf_token']) ||
+        !isset($_SESSION['csrf_token']) ||
+        !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token']) ||
+        !isset($_SESSION['csrf_token_time']) ||
+        time() - $_SESSION['csrf_token_time'] > CSRF_TOKEN_EXPIRE
+    ) {
+        header("Location: /login?error=" . urlencode('無効なリクエストです。'));
+        exit();
+    }
+
+    // ユーザー名とパスワードでのログイン処理
+    if (isset($_POST["username"]) && isset($_POST["password"])) {
+        $username = htmlspecialchars(trim($_POST["username"]), ENT_QUOTES, 'UTF-8');
         $password = trim($_POST["password"]);
 
-        if (!preg_match('/^[A-Z0-9_]{3,}$/i', $username)) {
-            $error_message = "ユーザー名は3文字以上、かつ1～9、A～Z、アンダースコアのみ使用できます。";
-        }
+        if (!empty($username) && !empty($password)) {
+            $username = htmlspecialchars($username, ENT_QUOTES, 'UTF-8');
 
-        if (!preg_match('/^[A-Z0-9!@#$%^&*()_+-=]{6,}$/i', $password)) {
-            $error_message = "パスワードは6文字以上、かつ1～9、A～Z、記号のみ使用できます。";
-        }
+            $stmt = $mysqli->prepare("
+                SELECT 
+                    u.id,
+                    u.username,
+                    u.password,
+                    uf.two_factor_enabled,
+                    uf.two_factor_secret
+                FROM users u
+                LEFT JOIN users_factor uf ON u.username = uf.username
+                WHERE u.username = ?
+            ");
 
-        $username = trim($_POST["username"]);
-        $password = trim($_POST["password"]);
-
-        $username = filter_var($username, FILTER_SANITIZE_STRING);
-
-        $stmt = $mysqli->prepare("SELECT id, password, last_session_id FROM users WHERE username = ?");
-        if ($stmt === false) {
-            $error_message = ('Prepare statement failed: ' . $mysqli->error);
-        }
-        $stmt->bind_param("s", $username);
-        $stmt->execute();
-        $stmt->store_result();
-
-        if ($stmt->num_rows == 1) {
-            $stmt->bind_result($id, $hashed_password, $last_session_id);
-            $stmt->fetch();
-
-            $stmt_login_date = $mysqli->prepare("SELECT last_login FROM users WHERE id = ?");
-            $stmt_login_date->bind_param("i", $id);
-            $stmt_login_date->execute();
-            $stmt_login_date->bind_result($last_login);
-            $stmt_login_date->fetch();
-            $stmt_login_date->close();
-
-            $current_time = new DateTime();
-
-            $last_login_time = new DateTime($last_login);
-
-            $interval = $current_time->diff($last_login_time);
-            if ($interval->days >= 3) {
-                session_regenerate_id(true);
+            if ($stmt === false) {
+                error_log("Database prepare error: " . $mysqli->error);
+                die('Database error occurred');
             }
 
-            if (password_verify($password, $hashed_password)) {
-                session_regenerate_id(true);
-                $_SESSION["user_id"] = $id;
+            $stmt->bind_param("s", $username);
+            $stmt->execute();
+            $result = $stmt->get_result();
 
-                $ip_address = $_SERVER['REMOTE_ADDR'];
-                $session_id = session_id();
+            if ($result->num_rows > 0) {
+                $user = $result->fetch_assoc();
 
-                // IPアドレスの取得
-                if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
-                    $ip_address = $_SERVER['HTTP_CLIENT_IP'];
-                } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-                    $x_forwarded_for = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
-                    $ip_address = trim($x_forwarded_for[0]);
+                if (password_verify($password, $user['password'])) {
+                    error_log("Password verified successfully");
+
+                    if ($user['two_factor_enabled'] == 1) {
+                        $_SESSION["pending_2fa_user_id"] = $user['id'];
+                        $_SESSION["pending_2fa_secret"] = $user['two_factor_secret'];
+
+                        echo '<script>
+                        window.onload = function() {
+                            document.getElementById("loginForm").style.display = "none";
+                            document.getElementById("authForm").style.display = "block";
+                        };
+                        </script>';
+                    } else {
+                        completeLogin($user['id'], $user['username'], $mysqli);
+                    }
                 } else {
-                    $ip_address = $_SERVER['REMOTE_ADDR'];
+                    $error_message = "ユーザー名またはパスワードが正しくありません。";
                 }
-                // テーブルにデータを挿入
-                $stmt_session_insert = $mysqli->prepare("INSERT INTO users_session (username, session_id, ip_address, created_at, last_login_at) VALUES (?, ?, ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE last_login_at = NOW()");
-                if ($stmt_session_insert) {
-                    $stmt_session_insert->bind_param("sss", $username, $session_id, $ip_address);
-                    $stmt_session_insert->execute();
-                    $stmt_session_insert->close();
-                }
-
-                $expire = time() + (100 * 365 * 24 * 60 * 60);
-                setcookie(session_name(), session_id(), $expire, "/");
-
-                $redirect_url = isset($_GET['auth']) ? filter_var($_GET['auth'], FILTER_SANITIZE_URL) : '/';
-                if (filter_var($redirect_url, FILTER_VALIDATE_URL)) {
-                    header("Location: $redirect_url");
-                } else {
-                    header("Location: /");
-                }
-                exit();
             } else {
-                $error_message = "認証に失敗しました。";
+                $error_message = "ユーザー名またはパスワードが正しくありません。";
             }
+
+            $stmt->close();
+        } else {
+            $error_message = "ユーザー名とパスワードを入力してください。";
+        }
+    }
+    // 2FAコード検証
+    elseif (
+        isset($_POST["code1"], $_POST["code2"], $_POST["code3"], $_POST["code4"], $_POST["code5"], $_POST["code6"]) &&
+        isset($_SESSION["pending_2fa_user_id"]) && isset($_SESSION["pending_2fa_secret"])
+    ) {
+
+        $user_id = $_SESSION["pending_2fa_user_id"];
+        $secret = $_SESSION["pending_2fa_secret"];
+
+        $code = $_POST["code1"] . $_POST["code2"] . $_POST["code3"] . $_POST["code4"] . $_POST["code5"] . $_POST["code6"];
+
+        require_once 'libs/GoogleAuthenticator.php';
+        $g = new PHPGangsta_GoogleAuthenticator();
+
+        if ($g->verifyCode($secret, $code, 2)) {
+            error_log("2FA code verified successfully");
+
+            $stmt = $mysqli->prepare("SELECT username FROM users WHERE id = ?");
+            if ($stmt) {
+                $stmt->bind_param("i", $user_id);
+                $stmt->execute();
+                $stmt->bind_result($username);
+                $stmt->fetch();
+                $stmt->close();
+
+                if ($username) {
+                    completeLogin($user_id, $username, $mysqli);
+                } else {
+                    $error_message = "ユーザー情報の取得に失敗しました。";
+                }
+            } else {
+                $error_message = "データベースエラーが発生しました。";
+            }
+        } else {
+            $error_message = "無効なセキュリティコードです。";
+        }
+    }
+
+    if (!empty($error_message)) {
+        echo "<script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelector('.error-text').innerText = " . json_encode($error_message) . ";
+            document.querySelector('.error-container').style.display = 'flex';
+        });
+        </script>";
+    }
+}
+
+// ログイン完了処理
+function completeLogin($user_id, $username, $mysqli)
+{
+    error_log("Completing login for user: " . $username);
+
+    session_regenerate_id(true);
+    $_SESSION["user_id"] = $user_id;
+
+    // IPアドレスの取得
+    $ip_address = $_SERVER['REMOTE_ADDR'];
+    if (!empty($_SERVER['HTTP_CLIENT_IP'])) {
+        $ip_address = $_SERVER['HTTP_CLIENT_IP'];
+    } elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $x_forwarded_for = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+        $ip_address = trim($x_forwarded_for[0]);
+    }
+
+    $session_id = session_id();
+
+    // セッション情報の更新
+    $stmt = $mysqli->prepare("
+    INSERT INTO users_session (
+        username, session_id, ip_address, created_at, last_login_at
+    ) 
+    VALUES (?, ?, ?, NOW(), NOW()) 
+    ON DUPLICATE KEY UPDATE 
+        session_id = VALUES(session_id), 
+        ip_address = VALUES(ip_address), 
+        last_login_at = NOW()
+");
+
+    if ($stmt) {
+        $stmt->bind_param("sss", $username, $session_id, $ip_address);
+        $success = $stmt->execute();
+        if (!$success) {
+            header("Location: /login?error=" . urlencode('セッション情報の更新に失敗しました。'));
         }
         $stmt->close();
-        $mysqli->close();
+    } else {
+        header("Location: /login?error=" . urlencode('セッション情報の更新に失敗しました。'));
     }
+
+    // セッションCookieの設定
+    $expire = time() + (100 * 365 * 24 * 60 * 60);
+    setcookie(session_name(), $session_id, [
+        'expires' => $expire,
+        'path' => '/',
+        'secure' => true,
+        'httponly' => true,
+        'samesite' => 'Strict'
+    ]);
+
+    // セキュリティメールを送信
+    $email = '';  // 初期化
+    $stmt = $mysqli->prepare("SELECT email FROM users WHERE id = ?");
+    if ($stmt) {
+        $stmt->bind_param("i", $user_id);
+        $stmt->execute();
+        $stmt->bind_result($email);
+        if ($stmt->fetch() && !empty($email)) {
+            $subject = "セキュリティメール";
+            $message = "
+            <html>
+            <head>
+              <title>セキュリティメール｜Zisty</title>
+            </head>
+            <body>
+              <p>" . $username . " 様</p>
+              <p>ユーザーのZisty Accountsに新しいログインが検出されました。心当たりのないログインがある場合は、すぐにパスワードを変更してください。</p>
+              <p>よろしくお願い致します。</p>
+              <p>TeamZisty / Zisty Accounts</p>
+            </body>
+            </html>
+      ";
+            $headers = "MIME-Version: 1.0" . "\r\n";
+            $headers .= "Content-type:text/html;charset=UTF-8" . "\r\n";
+            $headers .= "From: Zisty Accounts <no-reply@zisty.net>" . "\r\n";
+            $headers .= 'X-Mailer: PHP/' . phpversion();
+
+            mail($email, $subject, $message, $headers);
+        }
+        $stmt->close();
+    }
+
+    // リダイレクト処理
+    if (isset($_GET['auth'])) {
+        $client_id = htmlspecialchars(trim($_POST["auth"]), ENT_QUOTES, 'UTF-8');
+        $redirect_url = "https://accounts.zisty.net/oauth/?client_id=" . urlencode($client_id);
+    } else {
+        $redirect_url = '/';
+    }
+
+    header("Location: $redirect_url");
+    exit();
 }
 
 // CSRFトークンの生成
 $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+$_SESSION['csrf_token_time'] = time();
+
+// サードパーティーによる認証
+$client = new Google_Client();
+$client->setClientId('.apps.googleusercontent.com');
+$client->setClientSecret('GOCSPX-');
+$client->setRedirectUri('https://accounts.zisty.net/login/SSO/callback/google.php');
+$client->addScope('email');
+$client->addScope('profile');
+$googleUrl = $client->createAuthUrl();
+
+$client_id = '';
+$client_secret = '';
+$redirect_uri = 'https://accounts.zisty.net/login/SSO/callback/github.php';
+$githubUrl = "https://github.com/login/oauth/authorize?client_id={$client_id}&redirect_uri={$redirect_uri}";
 ?>
 
-<!DOCTYPE html>
 <!--
 
  _______                           ______ _       _
@@ -156,114 +400,161 @@ $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 <html lang="ja">
 
 <head>
-    <meta charset="utf-8" />
+    <meta charset="UTF-8">
     <title>Login｜Zisty</title>
-    <meta name="description" content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
+    <meta name="keywords" content=" Zisty,ジスティー">
+    <meta name="description"
+        content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
     <meta name="copyright" content="Copyright &copy; 2024 Zisty. All rights reserved." />
-    <meta property="og:title" content="Zisty Account - Login" />
-    <meta property="og:site_name" content="accounts.zisty.net">
-    <meta property="og:image" content="https://accounts.zisty.net/images/header.jpg">
-    <meta property="og:image:alt" content="バナー画像">
+    <!-- OGP Meta Tags -->
+    <meta property="og:title" content="Sign in to Zisty" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://accounts.zisty.net/" />
+    <meta property="og:image" content="https://accounts.zisty.net/images/header.jpg" />
+    <meta property="og:description"
+        content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?" />
+    <meta property="og:site_name" content="Zisty Accounts" />
     <meta property="og:locale" content="ja_JP" />
-    <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Zisty Account - Login" />
-    <meta name="twitter:description" content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
-    <meta name="twitter:image:src" content />
-    <meta name="twitter:site" content="accounts.zisty.net" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <!-- Twitter Card Meta Tags (if needed) -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:site" content="@teamzisty">
+    <meta name="twitter:creator" content="@teamzisty" />
+    <meta name="twitter:title" content="Sign in to Zisty">
+    <meta name="twitter:description"
+        content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
+    <meta name="twitter:image" content="https://accounts.zisty.net/images/header.jpg">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
     <link rel="shortcut icon" type="image/x-icon" href="/favicon.png">
-    <link rel="stylesheet" href="https://zisty.net/icon.css">
-    <link rel="stylesheet" href="https://zisty.net/header.css">
-    <link rel="stylesheet" href="../css/style.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
+    <script src="https://www.google.com/recaptcha/api.js"></script>
+    <script>
+        const timeStamp = new Date().getTime();
+        document.write('<link rel="stylesheet" href="https://accounts.zisty.net/css/login.css?time=' + timeStamp + '">');
+    </script>
 </head>
 
 <body>
-    <div id="loading-screen"><noscript>
-            <p><span style="font-size: 50px;">⚠</span><br>JavaScriptを有効にしてください。<br>Please enable JavaScript.</p>
-            <style>
-                .load {
-                    width: 0;
-                }
-            </style>
-        </noscript><img class="load" src="https://accounts.zisty.net/images/load.gif"></div>
-    <div class="header">
-    <div class="left-links">
-            <a class="header-a" href="https://zisty.net/"><i class="fa-solid fa-house"></i></a>
-            <a class="header-a" href="https://zisty.net/blog/">Blog</a>
-            <a class="header-a" href="https://accounts.zisty.net/" target="_blank">Accounts</a>
+    <div class="login-container">
+        <div class="login-form">
+            <div class="form">
+                <div class="icon">
+                    <a href="https://zisty.net"><img src="logo.png"></a>
+                </div>
+
+                <form id="loginForm" method="post" action="" onsubmit="return validateForm()"><input type="hidden"
+                        name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+
+                    <div class="error-container">
+                        <i class="fas fa-exclamation-circle error-icon"></i>
+                        <span class="error-text">An error has occurred! Please try again later.</span>
+                    </div>
+
+                    <h1>Welcome back</h1>
+                    <p class="details">Sign in to your enterprise account</p>
+                    <div class="input-group">
+                        <label for="username">Username</label>
+                        <input type="text" name="username" id="UserName" oninput="convertToLowercase(this)" class=""
+                            placeholder="" required>
+                    </div>
+                    <div class="input-group">
+                        <div class="password-group">
+                            <label for="password">Password</label>
+                            <a href="/password_reset/" class="forgot-password">Forgot Password?</a>
+                        </div>
+                        <input type="password" name="password" id="UserPassword" oninput="convertToLowercase(this)"
+                            class="" placeholder="" required>
+                    </div>
+                    <button type="submit">Sign In</button>
+
+                    <p class="signup">Don't have an account? <a href="/register/">Sign up</a></p>
+
+                    <div class="divider">
+                        <span>or</span>
+                    </div>
+                    <div class="social-login">
+                        <a href="<?php echo $githubUrl; ?>"><i class="fa-brands fa-github"></i> Continue with GitHub</a>
+                        <a href="<?php echo $googleUrl; ?>"><i class="fa-brands fa-google"></i> Continue with Google</a>
+                        <a href="/login/SSO/"><i class="fa-solid fa-key"></i> Continue with SSO</a>
+                    </div>
+                </form>
+
+                <form id="authForm" method="post" style="display:none;" onsubmit="return validateAuthForm()">
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+                    <input type="hidden" name="g-recaptcha-response" id="auth-g-recaptcha-response">
+                    <h1>Two-factor authentication</h1>
+                    <p class="details">Enter the authentication code from your two-factor authentication app</p>
+                    <div class="input-container">
+                        <input type="number" name="code1" class="digit-input" maxlength="1" required>
+                        <input type="number" name="code2" class="digit-input" maxlength="1" required>
+                        <input type="number" name="code3" class="digit-input" maxlength="1" required>
+                        <input type="number" name="code4" class="digit-input" maxlength="1" required>
+                        <input type="number" name="code5" class="digit-input" maxlength="1" required>
+                        <input type="number" name="code6" class="digit-input" maxlength="1" required>
+                    </div>
+                    <script>
+                        const inputs = document.querySelectorAll('.digit-input');
+                        inputs.forEach((input, index) => {
+                            input.addEventListener('input', (e) => {
+                                const value = e.target.value;
+                                if (value.length === 1) {
+                                    if (index < inputs.length - 1) {
+                                        inputs[index + 1].focus();
+                                    } else {
+                                        document.getElementById("authForm").submit();
+                                    }
+                                }
+                                if (value.length > 1) {
+                                    e.target.value = value.slice(0, 1);
+                                }
+                            });
+
+                            input.addEventListener('keydown', (e) => {
+                                if (e.key === 'Backspace') {
+                                    if (input.value === '' && index > 0) {
+                                        inputs[index - 1].focus();
+                                    } else {
+                                        input.value = '';
+                                    }
+                                }
+                            });
+                        });
+                    </script>
+                </form>
+
+                <div class="terms">
+                    <p>By continuing, you agree to Zisty's <a>Terms of Use</a> and <a>Privacy
+                            Policy</a>.<br>This site is protected by reCAPTCHA Enterprise and the Google <a
+                            href="https://policies.google.com/privacy" target="_blank">Privacy Policy</a> and <a
+                            href="https://policies.google.com/terms" target="_blank">Terms of Service</a> apply.</p>
+                </div>
+            </div>
         </div>
-        <div class="right-links"><a class="header-b" href=""></a><a class="header-b" href="https://github.com/zisty-h"><i
-                    class="fa-solid fa-boxes-stacked"></i></a><a class="header-bar">｜</a><a class="header-b" id="header"
-                onmouseover="showLanguageDropdown()" onmouseout="hideLanguageDropdown()"><i
-                    class="fa-solid fa-earth-americas"></i></a>
-            <div id="languageDropdown" onmouseover="keepLanguageDropdownVisible()" onmouseout="hideLanguageDropdown()"><a
-                    onclick="setLanguage('other')">English</a><a onclick="setLanguage('ja')">日本語</a></div>
-            <script>
-                function setLanguage(language) {
-                    document.cookie = "Language=" + language + "; path=/; max-age=" + (30 * 24 * 60 * 60);
-                    window.location.reload();
-                }
-            </script>
-        </div>
+        <div class="background"></div>
     </div>
-    <div class="center">
-        <form method="post" action="" onsubmit="return validateForm()"><input type="hidden" name="csrf_token"
-                value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>"><img src="https://zisty.net/favicon.png"
-                width="50px">
-            <h2>おかえりなさい！</h2><label for="username">ユーザー名</label>
-            <div class="TextBox"><input type="text" name="username" id="UserName" oninput="convertToLowercase(this)"
-                    class="" placeholder="" required></div><label for="password">パスワード</label>
-            <div class="TextBox"><input type="password" name="password" id="UserPassword"
-                    oninput="convertToLowercase(this)" class="" placeholder="" required></div>
-            <?php if (isset($error_message)) : ?>
-                <p class="error-message">
-                    <?php echo $error_message; ?>
-                </p>
-            <?php endif; ?><input type="submit" name="signup" value="ログイン">
-            <p>アカウントがない方はアカウントを作りましょう！<br><a href="/register">Sign up</a></p>
-            <?php if (!empty($error)): ?>
-                <p class="error-message">
-                    <?php echo $error; ?>
-                </p>
-            <?php endif; ?>
-            <p class="tp"><a href="https://zisty.net/terms/" target="_blank">Tos</a>｜<a
-                    href="https://zisty.net/privacy/" target="_blank">Privacy</a></p>
-        </form>
-    </div>
+
     <script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script>
-    <script src="../Warning.js"></script>
+    <script src="/js/Warning.js"></script>
+    <script src="https://www.google.com/recaptcha/api.js?render="></script>
     <script>
-        window.addEventListener('load', function() {
-            setTimeout(function() {
-                var loadingScreen = document.getElementById('loading-screen');
-                loadingScreen.style.animation = 'fadeOut 1s ease forwards';
-            }, 1000);
+        function onSubmit(token) {
+            document.getElementById("loginForm").submit();
+        }
+
+        grecaptcha.ready(function() {
+            grecaptcha.execute('', {
+                    action: 'login'
+                })
+                .then(function(token) {
+                    var recaptchaResponse = document.createElement('input');
+                    recaptchaResponse.setAttribute('type', 'hidden');
+                    recaptchaResponse.setAttribute('name', 'g-recaptcha-response');
+                    recaptchaResponse.setAttribute('value', token);
+                    document.getElementById('loginForm').appendChild(recaptchaResponse);
+                });
         });
     </script>
-    <script>
-        function showLanguageDropdown() {
-            document.getElementById("languageDropdown").style.display = "block";
-        }
 
-        function hideLanguageDropdown() {
-            document.getElementById("languageDropdown").style.display = "none";
-        }
-
-        function keepLanguageDropdownVisible() {
-            document.getElementById("languageDropdown").style.display = "block";
-        }
-    </script>
-    <script>
-        function onClick(e) {
-            e.preventDefault();
-            grecaptcha.ready(function() {
-                grecaptcha.execute('6LewliwpAAAAAItLoOTY1QQ_UJpntJZNmWUIiOPM', {
-                    action: 'submit'
-                }).then(function(token) {});
-            });
-        }
-    </script>
 </body>
 
 </html>

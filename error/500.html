@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>403｜Zisty</title>
+  <title>500｜Zisty</title>
   <meta name="description" content="Zisty Accounts is a service that allows you to easily integrate with Zisty's services. Why not give it a try?">
   <meta name="copyright" content="Copyright &copy; 2024 Zisty. All rights reserved." />
   <meta property="og:title" content="Zisty Account - Authorize" />
@@ -313,85 +313,6 @@
       color: #333333e1;
       font-size: 30px;
     }
-
-    .fancy-link {
-      font-family: 'Noto Sans JP', sans-serif;
-      display: inline-block;
-      padding: 12px 24px;
-      font-size: 1.125rem;
-      text-align: center;
-      text-decoration: none;
-      cursor: pointer;
-      border: none;
-      border-radius: 20px;
-      transition: background-color 0.5s, box-shadow 0.5s;
-      /* トランジション時間を追加 */
-      color: #fdfefc;
-      box-shadow: 0 10px 25px 0 rgba(34, 34, 34, 0.5);
-      margin-top: 10px;
-    }
-
-    .fancy-link.default {
-      background: linear-gradient(to right, rgb(0, 255, 42), rgb(0, 189, 41));
-      transition: background-color 0.5s, box-shadow 0.5s;
-      /* トランジション時間を追加 */
-    }
-
-    .fancy-link.default:hover {
-      background: linear-gradient(to right, rgb(0, 206, 34), rgb(0, 224, 49));
-      box-shadow: 0 15px 30px 0 rgba(34, 34, 34, 0.7);
-      /* box-shadow の変更に対するアニメーション */
-    }
-
-    .fancy-link.default1 {
-      background: linear-gradient(to right, rgb(0, 247, 255), rgb(0, 129, 189));
-      transition: background-color 0.5s, box-shadow 0.5s;
-      /* トランジション時間を追加 */
-    }
-
-    .fancy-link.default1:hover {
-      background: linear-gradient(to right, rgb(0, 206, 206), rgb(0, 160, 224));
-      box-shadow: 0 15px 30px 0 rgba(34, 34, 34, 0.7);
-      /* box-shadow の変更に対するアニメーション */
-    }
-
-    .fancy-link.default2 {
-      background: linear-gradient(to right, rgb(55, 0, 255), rgb(167, 0, 189));
-      transition: background-color 0.5s, box-shadow 0.5s;
-      /* トランジション時間を追加 */
-    }
-
-    .fancy-link.default2:hover {
-      background: linear-gradient(to right, rgb(124, 0, 206), rgb(34, 0, 224));
-      box-shadow: 0 15px 30px 0 rgba(34, 34, 34, 0.7);
-      /* box-shadow の変更に対するアニメーション */
-    }
-
-    .fancy-link.default3 {
-      background: linear-gradient(to right, rgb(29, 160, 241), rgb(137, 199, 238));
-      transition: background-color 0.5s, box-shadow 0.5s;
-      /* トランジション時間を追加 */
-    }
-
-    .fancy-link.default3:hover {
-      background: linear-gradient(to right, rgb(137, 199, 238), rgb(29, 160, 241));
-      box-shadow: 0 15px 30px 0 rgba(34, 34, 34, 0.7);
-      /* box-shadow の変更に対するアニメーション */
-    }
-
-    .fancy-link.default5 {
-      background: linear-gradient(to right, rgb(241, 29, 29), rgb(255, 166, 0));
-      transition: background-color 0.5s, box-shadow 0.5s;
-      /* トランジション時間を追加 */
-    }
-
-    .fancy-link.default5:hover {
-      background: linear-gradient(to right, rgb(255, 166, 0), rgb(241, 29, 29));
-      box-shadow: 0 15px 30px 0 rgba(34, 34, 34, 0.7);
-      /* box-shadow の変更に対するアニメーション */
-    }
-
-
     .fa-play {
       margin-right: 5px;
     }
@@ -415,8 +336,6 @@
     .box {
       margin-right: 5px;
     }
-
-
 
     .boxbox {
       width: 200px;
@@ -568,6 +487,11 @@
       color: #c8c3bc;
       text-decoration: underline solid #c8c3bc;
     }
+
+    .link {
+        color: #c8c3bc;
+        text-decoration: underline;
+    }
   </style>
 </head>
 
@@ -604,9 +528,9 @@
   <div class="center">
       <form>
         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
-        <img src="https://accounts.zisty.net/oauth/None.jpg" width="70px">
-        <h2>立ち入り禁止のようです</h2>
-        <p>申し訳ありませんが、あなたが要求したURLには制限がかかっており、アクセスできなくなっているようです。</p>
+        <img src="https://accounts.zisty.net/error/Ooops.jpg" width="70px">
+        <h2>Ooops!!!!</h2>
+        <p>サーバー側で何らかの理由によってエラーが発生しました。Zistyに報告するか<a class="link" href="https://teamzisty.instatus.com/">ステータス</a>を確認してみてください。</p>
 
         <p class="tp"><a href="https://zisty.net/terms/" target="_blank">Tos</a>｜<a
             href="https://zisty.net/privacy/" target="_blank">Privacy</a></p>
